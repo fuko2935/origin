@@ -30,8 +30,12 @@ g3/
 │   ├── g3-providers/             # LLM provider abstractions and implementations
 │   ├── g3-config/                # Configuration management
 │   ├── g3-execution/             # Code execution engine
-│   └── g3-computer-control/      # Computer control and automation
+│   ├── g3-computer-control/      # Computer control and automation
+│   ├── g3-console/               # Web-based monitoring UI (Axum + React)
+│   ├── g3-ensembles/             # Multi-agent "Flock" mode
+│   └── g3-planner/               # Planning/requirements mode with git integration
 ├── logs/                         # Session logs (auto-created)
+├── g3-plan/                      # Planning artifacts storage
 ├── README.md                     # Project documentation
 └── DESIGN.md                     # This design document
 ```
@@ -46,33 +50,37 @@ g3/
 │                 │    │                 │    │                 │
 │ • CLI parsing   │◄──►│ • Agent engine  │◄──►│ • Anthropic     │
 │ • Interactive   │    │ • Context mgmt  │    │ • Databricks    │
-│ • Retro TUI     │    │ • Tool system   │    │ • Embedded      │
-│ • Autonomous    │    │ • Streaming     │    │   (llama.cpp)   │
-│   mode          │    │ • Task exec     │    │ • OAuth flow    │
-│                 │    │ • TODO mgmt     │    │                 │
+│ • Retro TUI     │    │ • Tool system   │    │ • OpenAI-compat │
+│ • Autonomous    │    │ • Streaming     │    │ • Embedded      │
+│   mode          │    │ • Task exec     │    │   (llama.cpp)   │
+│ • Flock mode    │    │ • Code search   │    │ • OAuth flow    │
+│ • Planning mode │    │ • TODO mgmt     │    │                 │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
          │                       │                       │
          └───────────────────────┼───────────────────────┘
                                  │
-                    ┌─────────────────┐    ┌─────────────────┐
-                    │ g3-execution    │    │   g3-config     │
-                    │                 │    │                 │
-                    │ • Code exec     │    │ • TOML config   │
-                    │ • Shell cmds    │    │ • Env overrides │
-                    │ • Streaming     │    │ • Provider      │
-                    │ • Error hdlg    │    │   settings      │
-                    └─────────────────┘    │ • Computer      │
-                             │              │   control cfg   │
-                             │              └─────────────────┘
-                             │                       │
-                    ┌─────────────────┐             │
-                    │ g3-computer-    │◄────────────┘
-                    │   control       │
-                    │ • Mouse/kbd     │
-                    │ • Screenshots   │
-                    │ • OCR/Tesseract │
-                    │ • Windows/UI    │
-                    └─────────────────┘
+    ┌────────────────────────────┼────────────────────────────┐
+    │                            │                            │
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│ g3-execution    │    │   g3-config     │    │ g3-computer-    │
+│                 │    │                 │    │   control       │
+│ • Code exec     │    │ • TOML config   │    │ • Mouse/kbd     │
+│ • Shell cmds    │    │ • Env overrides │    │ • Screenshots   │
+│ • Streaming     │    │ • Provider      │    │ • OCR/Tesseract │
+│ • Error hdlg    │    │   settings      │    │ • WebDriver     │
+└─────────────────┘    │ • Named configs │    │ • macOS AX API  │
+                       └─────────────────┘    └─────────────────┘
+                                │
+    ┌───────────────────────────┼───────────────────────────┐
+    │                           │                           │
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│ g3-console      │    │ g3-ensembles    │    │ g3-planner      │
+│                 │    │                 │    │                 │
+│ • Web UI        │    │ • Flock mode    │    │ • Requirements  │
+│ • Axum backend  │    │ • Multi-agent   │    │ • Git integ     │
+│ • React front   │    │ • Parallel exec │    │ • Workflow      │
+│ • Monitoring    │    │ • Coordination  │    │ • Archiving     │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
 ```
 
 ## Core Components
@@ -102,6 +110,7 @@ g3/
 - `final_output`: Signal task completion with detailed summaries
 - `todo_read`: Read the entire TODO list content
 - `todo_write`: Write or overwrite the entire TODO list
+- `code_search`: Tree-sitter based semantic code search
 - `mouse_click`: Click the mouse at specific coordinates
 - `type_text`: Type text at the current cursor position
 - `find_element`: Find UI elements by text, role, or attributes
@@ -109,6 +118,7 @@ g3/
 - `extract_text`: Extract text from images or screen regions using OCR
 - `find_text_on_screen`: Find text visually on screen and return coordinates
 - `list_windows`: List all open windows with IDs and titles
+- `webdriver_*`: WebDriver browser automation tools (navigate, click, fill, screenshot)
 
 ### 2. g3-providers: LLM Provider Abstraction
 
@@ -121,6 +131,7 @@ g3/
 **Supported Providers:**
 - **Anthropic**: Claude models via API with native tool calling support
 - **Databricks**: Foundation Model APIs with OAuth and token-based authentication (default provider)
+- **OpenAI-Compatible**: Works with OpenRouter, Groq, and other OpenAI-compatible APIs
 - **Embedded**: Local models via llama.cpp with GPU acceleration (Metal/CUDA)
 - **Provider Registry**: Dynamic provider management and hot-swapping
 
@@ -213,6 +224,83 @@ g3/
 - **UI Automation**: Find elements, simulate clicks, type text
 - **Screenshot Capture**: Full screen, regions, or specific windows
 - **Accessibility**: Requires OS-level permissions for automation
+- **WebDriver**: Safari and Chrome browser automation
+- **macOS Accessibility API**: Native app control via AX API
+
+### 7. g3-console: Web-Based Monitoring UI
+
+**Primary Responsibilities:**
+- Web-based interface for monitoring G3 instances
+- Real-time log viewing and streaming
+- Process control and management
+- Instance lifecycle monitoring
+
+**Technology Stack:**
+- **Backend**: Axum web framework (Rust)
+- **Frontend**: React application
+- **Port**: Default 9090
+
+**Key Features:**
+- **Instance Dashboard**: View all running G3 instances
+- **Log Streaming**: Real-time log viewing with filtering
+- **Process Control**: Start, stop, and manage instances
+- **Chat View**: See conversation history for each instance
+
+### 8. g3-ensembles: Multi-Agent "Flock" Mode
+
+**Primary Responsibilities:**
+- Parallel multi-agent development orchestration
+- Project decomposition into parallelizable modules
+- Agent coordination and result merging
+- Dependency management between modules
+
+**Architecture:**
+```
+┌─────────────────┐
+│  Flock Manager  │
+│  (Orchestrator) │
+└───────┬─────────┘
+        │
+   ┌────┴────┬────────┬────────┐
+   ▼         ▼        ▼        ▼
+┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐
+│Agent│  │Agent│  │Agent│  │Agent│
+│  1  │  │  2  │  │  3  │  │  4  │
+└─────┘  └─────┘  └─────┘  └─────┘
+```
+
+**Key Features:**
+- **Parallel Execution**: Multiple agents work simultaneously
+- **Shared Context**: Agents can coordinate via shared state
+- **Error Isolation**: One failing agent doesn't crash the flock
+- **Result Merging**: Coordinated integration of agent outputs
+
+### 9. g3-planner: Planning/Requirements Mode
+
+**Primary Responsibilities:**
+- Requirements-driven development workflow
+- LLM-assisted requirements refinement
+- Git integration for automatic commits
+- Structured iteration cycles
+
+**Workflow:**
+1. **Refine**: Write requirements → LLM suggests improvements → User approves
+2. **Implement**: Coach-player loop implements approved requirements
+3. **Complete**: Archive artifacts, generate commit message, git commit
+4. **Repeat**: Return to step 1 for next iteration
+
+**Artifacts Directory** (`<codepath>/g3-plan/`):
+- `new_requirements.md`: Requirements being refined
+- `current_requirements.md`: Active requirements for implementation
+- `todo.g3.md`: Implementation TODO list
+- `planner_history.txt`: Audit log of planning activities
+- `completed_*.md`: Archived requirements and todos
+
+**Key Features:**
+- **Git Integration**: Automatic commits with LLM-generated messages
+- **Audit Logging**: Complete history of planning activities
+- **Role-Based Providers**: Separate LLM configs for planner, coach, and player
+- **No-Git Mode**: Works without git for uninitialized repos
 
 ## Advanced Features
 
@@ -408,12 +496,14 @@ This design document reflects the current state of G3 as a mature, production-re
 - ✅ **TODO Management**: In-memory TODO list with read/write tools
 
 ### Architecture Highlights
-- **Workspace**: 6 crates with clear separation of concerns
-- **Dependencies**: Modern Rust ecosystem (Tokio, Clap, Serde, etc.)
+- **Workspace**: 9 crates with clear separation of concerns
+- **Dependencies**: Modern Rust ecosystem (Tokio, Clap, Serde, Axum, etc.)
 - **Streaming**: Real-time response processing with tool call detection
 - **Cross-Platform**: Works on macOS, Linux, and Windows
 - **GPU Support**: Metal acceleration for local models on macOS, CUDA on Linux
 - **OCR Support**: Tesseract integration for text extraction from images
+- **WebDriver**: Safari and Chrome browser automation
+- **Web Console**: React-based monitoring UI with Axum backend
 
 ### Key Files
 - `src/main.rs`: main entry point delegating to g3-cli
@@ -424,3 +514,6 @@ This design document reflects the current state of G3 as a mature, production-re
 - `crates/g3-execution/src/lib.rs`: code execution engine
 - `crates/g3-computer-control/src/lib.rs`: computer control and automation
 - `crates/g3-computer-control/src/platform/`: platform-specific implementations
+- `crates/g3-console/src/lib.rs`: web console server
+- `crates/g3-ensembles/src/lib.rs`: flock mode orchestration
+- `crates/g3-planner/src/lib.rs`: planning mode workflow

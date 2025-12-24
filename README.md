@@ -12,19 +12,22 @@ G3 follows a modular architecture organized as a Rust workspace with multiple cr
 The heart of the agent system, containing:
 - **Agent Engine**: Main orchestration logic for handling conversations, tool execution, and task management
 - **Context Window Management**: Intelligent tracking of token usage with context thinning (50-80%) and auto-summarization at 80% capacity
-- **Tool System**: Built-in tools for file operations, shell commands, computer control, TODO management, and structured output
+- **Tool System**: Built-in tools for file operations, shell commands, computer control, TODO management, code search, and structured output
 - **Streaming Response Parser**: Real-time parsing of LLM responses with tool call detection and execution
 - **Task Execution**: Support for single and iterative task execution with automatic retry logic
+- **Code Search**: Tree-sitter based semantic code search supporting Rust, Python, JavaScript, TypeScript, Go, Java, C, C++
 
 #### **g3-providers**
 Abstraction layer for LLM providers:
 - **Provider Interface**: Common trait-based API for different LLM backends
-- **Multiple Provider Support**: 
+- **Multiple Provider Support**:
   - Anthropic (Claude models)
   - Databricks (DBRX and other models)
+  - OpenAI-compatible (OpenRouter, Groq, local servers)
   - Local/embedded models via llama.cpp with Metal acceleration on macOS
 - **OAuth Authentication**: Built-in OAuth flow support for secure provider authentication
 - **Provider Registry**: Dynamic provider management and selection
+- **Named Configurations**: Support for multiple named configurations per provider type
 
 #### **g3-config**
 Configuration management system:
@@ -46,6 +49,8 @@ Computer control capabilities:
 - UI element inspection and interaction
 - Screenshot capture and window management
 - OCR text extraction via Tesseract
+- WebDriver browser automation (Safari and Chrome)
+- macOS Accessibility API integration
 
 #### **g3-cli**
 Command-line interface:
@@ -53,6 +58,28 @@ Command-line interface:
 - Task submission and monitoring
 - Configuration management commands
 - Session management
+- Multiple execution modes
+
+#### **g3-console** (NEW)
+Web-based monitoring console:
+- Backend: Axum server (port 9090)
+- Frontend: React application
+- Instance monitoring and log viewing
+- Process control and management
+
+#### **g3-ensembles** (NEW)
+Multi-agent parallel development:
+- "Flock" mode for parallel agent execution
+- Module decomposition and coordination
+- Shared context between agents
+- Dependency management
+
+#### **g3-planner** (NEW)
+Requirements-driven development:
+- Planning mode with git integration
+- LLM-assisted requirements refinement
+- Structured workflow (refine → implement → complete)
+- Audit logging and artifact management
 
 ### Error Handling & Resilience
 
@@ -88,6 +115,7 @@ These commands give you fine-grained control over context management, allowing y
 - **Shell Integration**: Execute system commands with output capture
 - **Code Generation**: Structured code generation with syntax awareness
 - **TODO Management**: Read and write TODO lists with markdown checkbox format
+- **Code Search**: Tree-sitter based semantic code search (Rust, Python, JavaScript, TypeScript, Go, Java, C, C++)
 - **Computer Control** (Experimental): Automate desktop applications
   - Mouse and keyboard control
   - macOS Accessibility API for native app automation (via `--macax` flag)
@@ -95,7 +123,10 @@ These commands give you fine-grained control over context management, allowing y
   - Screenshot capture and window management
   - OCR text extraction from images and screen regions
   - Window listing and identification
-- **Code Search**: Embedded tree-sitter for syntax-aware code search (Rust, Python, JavaScript, TypeScript, Go, Java, C, C++) - see [Code Search Guide](docs/CODE_SEARCH.md)
+- **WebDriver Browser Automation**: Control Safari and Chrome programmatically
+  - Navigate to URLs, click elements, fill forms
+  - Execute JavaScript, take screenshots
+  - Safari (default) or Chrome headless mode
 - **Final Output**: Formatted result presentation
 - **Flock Mode**: Parallel multi-agent development for large projects - see [Flock Mode Guide](docs/FLOCK_MODE.md)
 
@@ -197,6 +228,30 @@ All planning artifacts are stored in `<codepath>/g3-plan/`:
 
 See the configuration section for setting up different providers for the planner role.
 
+### Flock Mode (Parallel Multi-Agent)
+
+Flock mode enables parallel development by running multiple AI agents on different modules simultaneously:
+
+```bash
+# Basic flock mode
+g3 --flock --project . --flock-workspace ./tmp
+
+# With specific number of parallel segments
+g3 --flock --project . --flock-workspace ./tmp --segments 4
+```
+
+Flock mode workflow:
+1. **Analyze**: Decomposes the project into parallelizable modules
+2. **Spawn**: Creates separate agents for each module
+3. **Execute**: Agents work in parallel with shared context
+4. **Merge**: Results are coordinated and dependencies resolved
+
+Use cases:
+- Large refactoring across multiple files
+- Implementing features that span multiple modules
+- Parallel test development
+- Documentation generation for multiple components
+
 ```bash
 # Build the project
 cargo build --release
@@ -215,6 +270,34 @@ g3 "implement a function to calculate fibonacci numbers"
 ## Configuration
 
 G3 uses a TOML configuration file for settings. The config file is automatically created at `~/.config/g3/config.toml` on first run with sensible defaults.
+
+### Provider Configuration
+
+G3 now uses **named provider configurations**, allowing multiple configurations per provider type:
+
+```toml
+[providers]
+default_provider = "anthropic.default"    # Format: <provider_type>.<config_name>
+planner = "anthropic.planner"             # Optional: specific config for planning mode
+coach = "anthropic.default"               # Optional: specific config for coach agent
+player = "anthropic.default"              # Optional: specific config for player agent
+
+[providers.anthropic.default]
+api_key = "sk-ant-..."
+model = "claude-sonnet-4-5"
+max_tokens = 64000
+temperature = 0.1
+
+[providers.anthropic.planner]
+api_key = "sk-ant-..."
+model = "claude-3-opus-20240229"
+max_tokens = 8192
+
+[providers.databricks.default]
+host = "https://your-workspace.cloud.databricks.com"
+model = "databricks-claude-sonnet-4"
+use_oauth = true
+```
 
 ### Retry Configuration
 

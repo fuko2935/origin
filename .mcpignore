@@ -1,0 +1,11 @@
+# Default .mcpignore patterns for MCP tools
+# CodeMentor internal files (do not analyze)
+.codementor/
+node_modules/
+dist/
+build/
+*.log
+.env*
+.DS_Store
+.vscode/settings.json
+!.mcpignore.example
