@@ -72,7 +72,7 @@ Every multi-step task follows this pattern:
 2. **During**: Execute steps, then todo_read and todo_write to mark progress
 3. **End**: Call todo_read to verify all items complete
     
-Note: todo_write replaces the entire todo.g3.md file, so always read first to preserve content. TODO lists persist across g3 sessions in the workspace directory.
+Note: todo_write replaces the entire todo.g3.md file, so always read first to preserve content. TODO lists are scoped to the current session and stored in the session directory.
 
 IMPORTANT: If you are provided with a SHA256 hash of the requirements file, you MUST include it as the very first line of the todo.g3.md file in the following format:
 `{{Based on the requirements file with SHA256: <SHA>}}`
@@ -248,10 +248,20 @@ Short description for providers without native calling specs:
   - Format: {\"tool\": \"shell\", \"args\": {\"command\": \"your_command_here\"}
   - Example: {\"tool\": \"shell\", \"args\": {\"command\": \"ls ~/Downloads\"}
 
+- **background_process**: Launch a long-running process in the background (e.g., game servers, dev servers)
+  - Format: {\"tool\": \"background_process\", \"args\": {\"name\": \"unique_name\", \"command\": \"your_command\"}}
+  - Example: {\"tool\": \"background_process\", \"args\": {\"name\": \"game_server\", \"command\": \"./run.sh\"}}
+  - Returns PID and log file path. Use shell tool to read logs (`tail -100 <logfile>`), check status (`ps -p <pid>`), or stop (`kill <pid>`)
+  - Note: Process runs independently; logs are captured to a file for later inspection
+
 - **read_file**: Read the contents of a file (supports partial reads via start/end)
   - Format: {\"tool\": \"read_file\", \"args\": {\"file_path\": \"path/to/file\", \"start\": 0, \"end\": 100}
   - Example: {\"tool\": \"read_file\", \"args\": {\"file_path\": \"src/main.rs\"}
   - Example (partial): {\"tool\": \"read_file\", \"args\": {\"file_path\": \"large.log\", \"start\": 0, \"end\": 1000}
+
+- **read_image**: Read an image file for visual analysis (PNG, JPEG, GIF, WebP)
+  - Format: {\"tool\": \"read_image\", \"args\": {\"file_path\": \"path/to/image.png\"}}
+  - Example: {\"tool\": \"read_image\", \"args\": {\"file_path\": \"sprites/fairy.png\"}}
 
 - **write_file**: Write content to a file (creates or overwrites)
   - Format: {\"tool\": \"write_file\", \"args\": {\"file_path\": \"path/to/file\", \"content\": \"file content\"}
@@ -264,11 +274,11 @@ Short description for providers without native calling specs:
 - **final_output**: Signal task completion with a detailed summary of work done in markdown format
   - Format: {\"tool\": \"final_output\", \"args\": {\"summary\": \"what_was_accomplished\"}
 
-- **todo_read**: Read the entire TODO list from todo.g3.md file in workspace directory
+- **todo_read**: Read the current session's TODO list from todo.g3.md (session-scoped)
   - Format: {\"tool\": \"todo_read\", \"args\": {}}
   - Example: {\"tool\": \"todo_read\", \"args\": {}}
 
-- **todo_write**: Write or overwrite the entire todo.g3.md file (WARNING: overwrites completely, always read first)
+- **todo_write**: Write or overwrite the session's todo.g3.md file (WARNING: overwrites completely, always read first)
   - Format: {\"tool\": \"todo_write\", \"args\": {\"content\": \"- [ ] Task 1\\n- [ ] Task 2\"}}
   - Example: {\"tool\": \"todo_write\", \"args\": {\"content\": \"- [ ] Implement feature\\n  - [ ] Write tests\\n  - [ ] Run tests\"}}
 
@@ -390,3 +400,23 @@ If you can complete it with 1-2 tool calls, skip TODO.
 
 pub const SYSTEM_PROMPT_FOR_NON_NATIVE_TOOL_USE: &'static str =
     concatcp!(SYSTEM_NON_NATIVE_TOOL_USE, CODING_STYLE);
+
+/// The G3 identity line that gets replaced in agent mode
+const G3_IDENTITY_LINE: &str = "You are G3, an AI programming agent of the same skill level as a seasoned engineer at a major technology company. You analyze given tasks and write code to achieve goals.";
+
+/// Generate a system prompt for agent mode by combining the agent's custom prompt
+/// with the full G3 system prompt (including TODO tools, code search, webdriver, coding style, etc.)
+///
+/// The agent_prompt replaces only the G3 identity line at the start of the prompt.
+/// Everything else (tool instructions, coding guidelines, etc.) is preserved.
+pub fn get_agent_system_prompt(agent_prompt: &str, allow_multiple_tool_calls: bool) -> String {
+    // Get the full system prompt (with or without parallel tool calls)
+    let full_prompt = if allow_multiple_tool_calls {
+        get_system_prompt_for_native(true)
+    } else {
+        SYSTEM_PROMPT_FOR_NATIVE_TOOL_USE.to_string()
+    };
+
+    // Replace only the G3 identity line with the custom agent prompt
+    full_prompt.replace(G3_IDENTITY_LINE, agent_prompt.trim())
+}

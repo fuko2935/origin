@@ -12,7 +12,7 @@ use crate::{logs_dir, Agent, TaskResult};
 use crate::ui_writer::UiWriter;
 use serde_json::Value;
 use std::path::PathBuf;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// Result of feedback extraction with source information
 #[derive(Debug, Clone)]
@@ -103,21 +103,21 @@ where
     // Try session log first (most reliable)
     if let Some(session_id) = agent.get_session_id() {
         if let Some(feedback) = try_extract_from_session_log(&session_id, config) {
-            info!("Extracted coach feedback from session log: {} chars", feedback.len());
+            debug!("Extracted coach feedback from session log: {} chars", feedback.len());
             return ExtractedFeedback::new(feedback, FeedbackSource::SessionLog);
         }
     }
 
     // Try native tool call JSON parsing
     if let Some(feedback) = try_extract_from_native_tool_call(&coach_result.response) {
-        info!("Extracted coach feedback from native tool call: {} chars", feedback.len());
+        debug!("Extracted coach feedback from native tool call: {} chars", feedback.len());
         return ExtractedFeedback::new(feedback, FeedbackSource::NativeToolCall);
     }
 
     // Try conversation history
     if let Some(session_id) = agent.get_session_id() {
         if let Some(feedback) = try_extract_from_conversation_history(&session_id, config) {
-            info!("Extracted coach feedback from conversation history: {} chars", feedback.len());
+            debug!("Extracted coach feedback from conversation history: {} chars", feedback.len());
             return ExtractedFeedback::new(feedback, FeedbackSource::ConversationHistory);
         }
     }
@@ -125,7 +125,7 @@ where
     // Try TaskResult parsing
     let extracted = coach_result.extract_final_output();
     if !extracted.is_empty() {
-        info!("Extracted coach feedback from task result: {} chars", extracted.len());
+        debug!("Extracted coach feedback from task result: {} chars", extracted.len());
         return ExtractedFeedback::new(extracted, FeedbackSource::TaskResultResponse);
     }
 
@@ -139,8 +139,16 @@ fn try_extract_from_session_log(
     session_id: &str,
     config: &FeedbackExtractionConfig,
 ) -> Option<String> {
-    let logs_path = config.logs_dir.clone().unwrap_or_else(logs_dir);
-    let log_file_path = logs_path.join(format!("g3_session_{}.json", session_id));
+    // Try new .g3/sessions/<session_id>/session.json path first
+    let log_file_path = crate::get_session_file(session_id);
+    
+    // Fall back to old logs/ path if new path doesn't exist
+    let log_file_path = if log_file_path.exists() {
+        log_file_path
+    } else {
+        let logs_path = config.logs_dir.clone().unwrap_or_else(logs_dir);
+        logs_path.join(format!("g3_session_{}.json", session_id))
+    };
 
     if !log_file_path.exists() {
         debug!("Session log file not found: {:?}", log_file_path);
@@ -275,8 +283,16 @@ fn try_extract_from_conversation_history(
     session_id: &str,
     config: &FeedbackExtractionConfig,
 ) -> Option<String> {
-    let logs_path = config.logs_dir.clone().unwrap_or_else(logs_dir);
-    let log_file_path = logs_path.join(format!("g3_session_{}.json", session_id));
+    // Try new .g3/sessions/<session_id>/session.json path first
+    let log_file_path = crate::get_session_file(session_id);
+    
+    // Fall back to old logs/ path if new path doesn't exist
+    let log_file_path = if log_file_path.exists() {
+        log_file_path
+    } else {
+        let logs_path = config.logs_dir.clone().unwrap_or_else(logs_dir);
+        logs_path.join(format!("g3_session_{}.json", session_id))
+    };
 
     if !log_file_path.exists() {
         return None;

@@ -1,23 +1,28 @@
+pub mod background_process;
 pub mod code_search;
 pub mod error_handling;
 pub mod feedback_extraction;
+pub mod paths;
 pub mod project;
 pub mod retry;
+pub mod session_continuation;
+pub mod streaming_parser;
 pub mod task_result;
 pub mod ui_writer;
+pub mod utils;
+pub mod webdriver_session;
 
 pub use task_result::TaskResult;
 pub use retry::{RetryConfig, RetryResult, execute_with_retry, retry_operation};
 pub use feedback_extraction::{ExtractedFeedback, FeedbackSource, FeedbackExtractionConfig, extract_coach_feedback};
+pub use session_continuation::{SessionContinuation, load_continuation, save_continuation, clear_continuation, has_valid_continuation, get_session_dir, load_context_from_session_log};
+
+// Export agent prompt generation for CLI use
+pub use prompts::get_agent_system_prompt;
 
 #[cfg(test)]
 mod task_result_comprehensive_tests;
 use crate::ui_writer::UiWriter;
-
-// Make fixed_filter_json public so it can be accessed from g3-cli
-pub mod fixed_filter_json;
-#[cfg(test)]
-mod fixed_filter_tests;
 
 #[cfg(test)]
 mod tilde_expansion_tests;
@@ -27,7 +32,6 @@ mod error_handling_test;
 mod prompts;
 
 use anyhow::Result;
-use chrono::Local;
 use g3_computer_control::WebDriverController;
 use g3_config::Config;
 use g3_execution::CodeExecutor;
@@ -37,47 +41,17 @@ use prompts::{get_system_prompt_for_native, SYSTEM_PROMPT_FOR_NON_NATIVE_TOOL_US
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::fs::OpenOptions;
 use std::io::Write;
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
-/// Get the path to the todo.g3.md file.
-/// 
-/// Checks for G3_TODO_PATH environment variable first (used by planning mode),
-/// then falls back to todo.g3.md in the current directory.
-fn get_todo_path() -> std::path::PathBuf {
-    if let Ok(custom_path) = std::env::var("G3_TODO_PATH") {
-        std::path::PathBuf::from(custom_path)
-    } else {
-        std::env::current_dir().unwrap_or_default().join("todo.g3.md")
-    }
-}
-
-/// Get the path to the logs directory.
-///
-/// Checks for G3_WORKSPACE_PATH environment variable first (used by planning mode),
-/// then falls back to "logs" in the current directory.
-fn get_logs_dir() -> std::path::PathBuf {
-    if let Ok(workspace_path) = std::env::var("G3_WORKSPACE_PATH") {
-        let logs_path = std::path::PathBuf::from(workspace_path).join("logs");
-        logs_path
-    } else {
-        let logs_path = std::env::current_dir().unwrap_or_default().join("logs");
-        logs_path
-    }
-}
-
-/// Public accessor for the logs directory path (for use by submodules)
-pub fn logs_dir() -> std::path::PathBuf {
-    get_logs_dir()
-}
-
-/// Environment variable name for workspace path
-/// Used to direct all logs to the workspace directory
-pub const G3_WORKSPACE_PATH_ENV: &str = "G3_WORKSPACE_PATH";
+// Re-export path utilities for backward compatibility
+pub use paths::{
+    G3_WORKSPACE_PATH_ENV, ensure_session_dir, get_context_summary_file, get_g3_dir, get_logs_dir,
+    get_session_file, get_session_logs_dir, get_thinned_dir, logs_dir,
+};
+use paths::{get_todo_path, get_session_todo_path};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -85,108 +59,9 @@ pub struct ToolCall {
     pub args: serde_json::Value, // Should be a JSON object with tool-specific arguments
 }
 
-/// Unified WebDriver session that can hold either Safari or Chrome driver
-pub enum WebDriverSession {
-    Safari(g3_computer_control::SafariDriver),
-    Chrome(g3_computer_control::ChromeDriver),
-}
 
-#[async_trait::async_trait]
-impl g3_computer_control::WebDriverController for WebDriverSession {
-    async fn navigate(&mut self, url: &str) -> anyhow::Result<()> {
-        match self {
-            WebDriverSession::Safari(driver) => driver.navigate(url).await,
-            WebDriverSession::Chrome(driver) => driver.navigate(url).await,
-        }
-    }
-
-    async fn current_url(&self) -> anyhow::Result<String> {
-        match self {
-            WebDriverSession::Safari(driver) => driver.current_url().await,
-            WebDriverSession::Chrome(driver) => driver.current_url().await,
-        }
-    }
-
-    async fn title(&self) -> anyhow::Result<String> {
-        match self {
-            WebDriverSession::Safari(driver) => driver.title().await,
-            WebDriverSession::Chrome(driver) => driver.title().await,
-        }
-    }
-
-    async fn find_element(&mut self, selector: &str) -> anyhow::Result<g3_computer_control::WebElement> {
-        match self {
-            WebDriverSession::Safari(driver) => driver.find_element(selector).await,
-            WebDriverSession::Chrome(driver) => driver.find_element(selector).await,
-        }
-    }
-
-    async fn find_elements(&mut self, selector: &str) -> anyhow::Result<Vec<g3_computer_control::WebElement>> {
-        match self {
-            WebDriverSession::Safari(driver) => driver.find_elements(selector).await,
-            WebDriverSession::Chrome(driver) => driver.find_elements(selector).await,
-        }
-    }
-
-    async fn execute_script(&mut self, script: &str, args: Vec<serde_json::Value>) -> anyhow::Result<serde_json::Value> {
-        match self {
-            WebDriverSession::Safari(driver) => driver.execute_script(script, args).await,
-            WebDriverSession::Chrome(driver) => driver.execute_script(script, args).await,
-        }
-    }
-
-    async fn page_source(&self) -> anyhow::Result<String> {
-        match self {
-            WebDriverSession::Safari(driver) => driver.page_source().await,
-            WebDriverSession::Chrome(driver) => driver.page_source().await,
-        }
-    }
-
-    async fn screenshot(&mut self, path: &str) -> anyhow::Result<()> {
-        match self {
-            WebDriverSession::Safari(driver) => driver.screenshot(path).await,
-            WebDriverSession::Chrome(driver) => driver.screenshot(path).await,
-        }
-    }
-
-    async fn close(&mut self) -> anyhow::Result<()> {
-        match self {
-            WebDriverSession::Safari(driver) => driver.close().await,
-            WebDriverSession::Chrome(driver) => driver.close().await,
-        }
-    }
-
-    async fn quit(self) -> anyhow::Result<()> {
-        match self {
-            WebDriverSession::Safari(driver) => driver.quit().await,
-            WebDriverSession::Chrome(driver) => driver.quit().await,
-        }
-    }
-}
-
-// Additional methods for WebDriverSession that aren't part of the WebDriverController trait
-impl WebDriverSession {
-    pub async fn back(&mut self) -> anyhow::Result<()> {
-        match self {
-            WebDriverSession::Safari(driver) => driver.back().await,
-            WebDriverSession::Chrome(driver) => driver.back().await,
-        }
-    }
-
-    pub async fn forward(&mut self) -> anyhow::Result<()> {
-        match self {
-            WebDriverSession::Safari(driver) => driver.forward().await,
-            WebDriverSession::Chrome(driver) => driver.forward().await,
-        }
-    }
-
-    pub async fn refresh(&mut self) -> anyhow::Result<()> {
-        match self {
-            WebDriverSession::Safari(driver) => driver.refresh().await,
-            WebDriverSession::Chrome(driver) => driver.refresh().await,
-        }
-    }
-}
+// Re-export WebDriverSession from its own module
+pub use webdriver_session::WebDriverSession;
 
 /// Options for fast-start discovery execution
 #[derive(Debug, Clone)]
@@ -203,226 +78,10 @@ pub enum StreamState {
     Resuming,
 }
 
-/// Modern streaming tool parser that properly handles native tool calls and SSE chunks
-#[derive(Debug)]
-pub struct StreamingToolParser {
-    /// Buffer for accumulating text content
-    text_buffer: String,
-    /// Buffer for accumulating native tool calls
-    native_tool_calls: Vec<g3_providers::ToolCall>,
-    /// Whether we've received a message_stop event
-    message_stopped: bool,
-    /// Whether we're currently in a JSON tool call (for fallback parsing)
-    in_json_tool_call: bool,
-    /// Start position of JSON tool call (for fallback parsing)
-    json_tool_start: Option<usize>,
-}
 
-impl Default for StreamingToolParser {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// Re-export StreamingToolParser from its own module
+pub use streaming_parser::StreamingToolParser;
 
-impl StreamingToolParser {
-    pub fn new() -> Self {
-        Self {
-            text_buffer: String::new(),
-            native_tool_calls: Vec::new(),
-            message_stopped: false,
-            in_json_tool_call: false,
-            json_tool_start: None,
-        }
-    }
-
-    /// Process a streaming chunk and return completed tool calls if any
-    pub fn process_chunk(&mut self, chunk: &g3_providers::CompletionChunk) -> Vec<ToolCall> {
-        let mut completed_tools = Vec::new();
-
-        // Add text content to buffer
-        if !chunk.content.is_empty() {
-            self.text_buffer.push_str(&chunk.content);
-        }
-
-        // Handle native tool calls - return them immediately when received
-        // This allows tools to be executed as soon as they're fully parsed,
-        // preventing duplicate tool calls from being accumulated
-        if let Some(ref tool_calls) = chunk.tool_calls {
-            debug!("Received native tool calls: {:?}", tool_calls);
-
-            // Convert and return tool calls immediately
-            for tool_call in tool_calls {
-                let converted_tool = ToolCall {
-                    tool: tool_call.tool.clone(),
-                    args: tool_call.args.clone(),
-                };
-                completed_tools.push(converted_tool);
-            }
-        }
-
-        // Check if message is finished/stopped
-        if chunk.finished {
-            self.message_stopped = true;
-            debug!("Message finished, processing accumulated tool calls");
-        }
-
-        // Fallback: Try to parse JSON tool calls from text if no native tool calls
-        if completed_tools.is_empty() && !chunk.content.is_empty() {
-            if let Some(json_tool) = self.try_parse_json_tool_call(&chunk.content) {
-                completed_tools.push(json_tool);
-            }
-        }
-
-        completed_tools
-    }
-
-    /// Fallback method to parse JSON tool calls from text content
-    fn try_parse_json_tool_call(&mut self, _content: &str) -> Option<ToolCall> {
-        // Look for JSON tool call patterns
-        let patterns = [
-            r#"{"tool":"#,
-            r#"{ "tool":"#,
-            r#"{"tool" :"#,
-            r#"{ "tool" :"#,
-        ];
-
-        // If we're not currently in a JSON tool call, look for the start
-        if !self.in_json_tool_call {
-            for pattern in &patterns {
-                if let Some(pos) = self.text_buffer.rfind(pattern) {
-                    debug!(
-                        "Found JSON tool call pattern '{}' at position {}",
-                        pattern, pos
-                    );
-                    self.in_json_tool_call = true;
-                    self.json_tool_start = Some(pos);
-                    break;
-                }
-            }
-        }
-
-        // If we're in a JSON tool call, try to find the end and parse it
-        if self.in_json_tool_call {
-            if let Some(start_pos) = self.json_tool_start {
-                let json_text = &self.text_buffer[start_pos..];
-
-                // Try to find a complete JSON object
-                let mut brace_count = 0;
-                let mut in_string = false;
-                let mut escape_next = false;
-
-                for (i, ch) in json_text.char_indices() {
-                    if escape_next {
-                        escape_next = false;
-                        continue;
-                    }
-
-                    match ch {
-                        '\\' => escape_next = true,
-                        '"' if !escape_next => in_string = !in_string,
-                        '{' if !in_string => brace_count += 1,
-                        '}' if !in_string => {
-                            brace_count -= 1;
-                            if brace_count == 0 {
-                                // Found complete JSON object
-                                let json_str = &json_text[..=i];
-                                debug!("Attempting to parse JSON tool call: {}", json_str);
-
-                                // First try to parse as a ToolCall
-                                if let Ok(tool_call) = serde_json::from_str::<ToolCall>(json_str) {
-                                    // Validate that this is actually a proper tool call
-                                    // The args should be a JSON object with reasonable keys
-                                    if let Some(args_obj) = tool_call.args.as_object() {
-                                        // Check if any key looks like it contains agent message content
-                                        // This would indicate a malformed tool call where the message
-                                        // got mixed into the args
-                                        let has_message_like_key = args_obj.keys().any(|key| {
-                                            key.len() > 100
-                                                || key.contains('\n')
-                                                || key.contains("I'll")
-                                                || key.contains("Let me")
-                                                || key.contains("Here's")
-                                                || key.contains("I can")
-                                                || key.contains("I need")
-                                                || key.contains("First")
-                                                || key.contains("Now")
-                                                || key.contains("The ")
-                                        });
-
-                                        if has_message_like_key {
-                                            debug!("Detected malformed tool call with message-like keys, skipping");
-                                            // This looks like a malformed tool call, skip it
-                                            self.in_json_tool_call = false;
-                                            self.json_tool_start = None;
-                                            break;
-                                        }
-
-                                        // Also check if the values look reasonable
-                                        // Tool arguments should typically be file paths, commands, or content
-                                        // Not entire agent messages
-
-                                        debug!(
-                                            "Successfully parsed valid JSON tool call: {:?}",
-                                            tool_call
-                                        );
-                                        // Reset JSON parsing state
-                                        self.in_json_tool_call = false;
-                                        self.json_tool_start = None;
-                                        return Some(tool_call);
-                                    }
-                                    // If args is not an object, skip this as invalid
-                                    debug!("Tool call args is not an object, skipping");
-                                } else {
-                                    debug!("Failed to parse JSON tool call: {}", json_str);
-                                    // Reset and continue looking
-                                    self.in_json_tool_call = false;
-                                    self.json_tool_start = None;
-                                }
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Get the accumulated text content (excluding tool calls)
-    pub fn get_text_content(&self) -> &str {
-        &self.text_buffer
-    }
-
-    /// Get content before a specific position (for display purposes)
-    pub fn get_content_before_position(&self, pos: usize) -> String {
-        if pos <= self.text_buffer.len() {
-            self.text_buffer[..pos].to_string()
-        } else {
-            self.text_buffer.clone()
-        }
-    }
-
-    /// Check if the message has been stopped/finished
-    pub fn is_message_stopped(&self) -> bool {
-        self.message_stopped
-    }
-
-    /// Reset the parser state for a new message
-    pub fn reset(&mut self) {
-        self.text_buffer.clear();
-        self.native_tool_calls.clear();
-        self.message_stopped = false;
-        self.in_json_tool_call = false;
-        self.json_tool_start = None;
-    }
-
-    /// Get the current text buffer length (for position tracking)
-    pub fn text_buffer_len(&self) -> usize {
-        self.text_buffer.len()
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct ContextWindow {
@@ -522,6 +181,23 @@ impl ContextWindow {
         } else {
             (self.used_tokens as f32 / self.total_tokens as f32) * 100.0
         }
+    }
+
+    /// Clear the conversation history while preserving system messages
+    /// Used by /clear command to start fresh
+    pub fn clear_conversation(&mut self) {
+        // Keep only system messages (system prompt, README, etc.)
+        let system_messages: Vec<Message> = self.conversation_history
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::System))
+            .cloned()
+            .collect();
+        
+        self.conversation_history = system_messages;
+        self.used_tokens = self.conversation_history.iter()
+            .map(|m| Self::estimate_tokens(&m.content))
+            .sum();
+        self.last_thinning_percentage = 0;
     }
 
     pub fn remaining_tokens(&self) -> u32 {
@@ -632,7 +308,8 @@ Format this as a detailed but concise summary that can be used to resume the con
 
     /// Perform context thinning: scan first third of conversation and replace large tool results
     /// Returns a summary message about what was thinned
-    pub fn thin_context(&mut self) -> (String, usize) {
+    /// If session_id is provided, thinned content is saved to .g3/session/<session_id>/thinned/
+    pub fn thin_context(&mut self, session_id: Option<&str>) -> (String, usize) {
         let current_percentage = self.percentage_used() as u32;
         let current_threshold = (current_percentage / 10) * 10;
 
@@ -647,15 +324,28 @@ Format this as a detailed but concise summary that can be used to resume the con
         let mut tool_call_leaned_count = 0;
         let mut chars_saved = 0;
 
-        // Create ~/tmp directory if it doesn't exist
-        let tmp_dir = shellexpand::tilde("~/tmp").to_string();
-        if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
-            warn!("Failed to create ~/tmp directory: {}", e);
-            return (
-                "⚠️  Context thinning failed: could not create ~/tmp directory".to_string(),
-                0,
-            );
-        }
+        // Determine output directory: use session dir if available, otherwise ~/tmp
+        let tmp_dir = if let Some(sid) = session_id {
+            let thinned_dir = get_thinned_dir(sid);
+            if let Err(e) = std::fs::create_dir_all(&thinned_dir) {
+                warn!("Failed to create thinned directory: {}", e);
+                return (
+                    "⚠️  Context thinning failed: could not create thinned directory".to_string(),
+                    0,
+                );
+            }
+            thinned_dir.to_string_lossy().to_string()
+        } else {
+            let fallback_dir = shellexpand::tilde("~/tmp").to_string();
+            if let Err(e) = std::fs::create_dir_all(&fallback_dir) {
+                warn!("Failed to create ~/tmp directory: {}", e);
+                return (
+                    "⚠️  Context thinning failed: could not create ~/tmp directory".to_string(),
+                    0,
+                );
+            }
+            fallback_dir
+        };
 
         // Scan the first third of messages
         for i in 0..first_third_end {
@@ -869,7 +559,8 @@ Format this as a detailed but concise summary that can be used to resume the con
     /// Perform context thinning on the ENTIRE conversation history (not just first third)
     /// This is the "skinnify" variant that processes all messages
     /// Returns a summary message about what was thinned
-    pub fn thin_context_all(&mut self) -> (String, usize) {
+    /// If session_id is provided, thinned content is saved to .g3/session/<session_id>/thinned/
+    pub fn thin_context_all(&mut self, session_id: Option<&str>) -> (String, usize) {
         let current_percentage = self.percentage_used() as u32;
 
         // Calculate the total messages - process ALL of them
@@ -879,15 +570,28 @@ Format this as a detailed but concise summary that can be used to resume the con
         let mut tool_call_leaned_count = 0;
         let mut chars_saved = 0;
 
-        // Create ~/tmp directory if it doesn't exist
-        let tmp_dir = shellexpand::tilde("~/tmp").to_string();
-        if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
-            warn!("Failed to create ~/tmp directory: {}", e);
-            return (
-                "⚠️  Context skinnifying failed: could not create ~/tmp directory".to_string(),
-                0,
-            );
-        }
+        // Determine output directory: use session dir if available, otherwise ~/tmp
+        let tmp_dir = if let Some(sid) = session_id {
+            let thinned_dir = get_thinned_dir(sid);
+            if let Err(e) = std::fs::create_dir_all(&thinned_dir) {
+                warn!("Failed to create thinned directory: {}", e);
+                return (
+                    "⚠️  Context skinnifying failed: could not create thinned directory".to_string(),
+                    0,
+                );
+            }
+            thinned_dir.to_string_lossy().to_string()
+        } else {
+            let fallback_dir = shellexpand::tilde("~/tmp").to_string();
+            if let Err(e) = std::fs::create_dir_all(&fallback_dir) {
+                warn!("Failed to create ~/tmp directory: {}", e);
+                return (
+                    "⚠️  Context skinnifying failed: could not create ~/tmp directory".to_string(),
+                    0,
+                );
+            }
+            fallback_dir
+        };
 
         // Scan ALL messages (not just first third)
         for i in 0..total_messages {
@@ -1162,6 +866,9 @@ pub struct Agent<W: UiWriter> {
     requirements_sha: Option<String>,
     /// Working directory for tool execution (set by --codebase-fast-start)
     working_dir: Option<String>,
+    background_process_manager: std::sync::Arc<background_process::BackgroundProcessManager>,
+    /// Pending images to attach to the next user message
+    pending_images: Vec<g3_providers::ImageContent>,
 }
 
 impl<W: UiWriter> Agent<W> {
@@ -1174,7 +881,7 @@ impl<W: UiWriter> Agent<W> {
         ui_writer: W,
         readme_content: Option<String>,
     ) -> Result<Self> {
-        Self::new_with_mode_and_readme(config, ui_writer, false, readme_content, false).await
+        Self::new_with_mode_and_readme(config, ui_writer, false, readme_content, false, None).await
     }
 
     pub async fn new_autonomous_with_readme(
@@ -1182,7 +889,7 @@ impl<W: UiWriter> Agent<W> {
         ui_writer: W,
         readme_content: Option<String>,
     ) -> Result<Self> {
-        Self::new_with_mode_and_readme(config, ui_writer, true, readme_content, false).await
+        Self::new_with_mode_and_readme(config, ui_writer, true, readme_content, false, None).await
     }
 
     pub async fn new_autonomous(config: Config, ui_writer: W) -> Result<Self> {
@@ -1199,7 +906,7 @@ impl<W: UiWriter> Agent<W> {
         readme_content: Option<String>,
         quiet: bool,
     ) -> Result<Self> {
-        Self::new_with_mode_and_readme(config, ui_writer, false, readme_content, quiet).await
+        Self::new_with_mode_and_readme(config, ui_writer, false, readme_content, quiet, None).await
     }
 
     pub async fn new_autonomous_with_readme_and_quiet(
@@ -1208,7 +915,18 @@ impl<W: UiWriter> Agent<W> {
         readme_content: Option<String>,
         quiet: bool,
     ) -> Result<Self> {
-        Self::new_with_mode_and_readme(config, ui_writer, true, readme_content, quiet).await
+        Self::new_with_mode_and_readme(config, ui_writer, true, readme_content, quiet, None).await
+    }
+
+    /// Create a new agent with a custom system prompt (for agent mode)
+    /// The custom_system_prompt replaces the default G3 system prompt entirely
+    pub async fn new_with_custom_prompt(
+        config: Config,
+        ui_writer: W,
+        custom_system_prompt: String,
+        readme_content: Option<String>,
+    ) -> Result<Self> {
+        Self::new_with_mode_and_readme(config, ui_writer, false, readme_content, false, Some(custom_system_prompt)).await
     }
 
     async fn new_with_mode(
@@ -1217,7 +935,7 @@ impl<W: UiWriter> Agent<W> {
         is_autonomous: bool,
         quiet: bool,
     ) -> Result<Self> {
-        Self::new_with_mode_and_readme(config, ui_writer, is_autonomous, None, quiet).await
+        Self::new_with_mode_and_readme(config, ui_writer, is_autonomous, None, quiet, None).await
     }
 
     async fn new_with_mode_and_readme(
@@ -1226,6 +944,7 @@ impl<W: UiWriter> Agent<W> {
         is_autonomous: bool,
         readme_content: Option<String>,
         quiet: bool,
+        custom_system_prompt: Option<String>,
     ) -> Result<Self> {
         let mut providers = ProviderRegistry::new();
 
@@ -1374,12 +1093,18 @@ impl<W: UiWriter> Agent<W> {
         let provider_has_native_tool_calling = provider.has_native_tool_calling();
         let _ = provider; // Drop provider reference to avoid borrowing issues
 
-        let system_prompt = if provider_has_native_tool_calling {
-            // For native tool calling providers, use a more explicit system prompt
-            get_system_prompt_for_native(config.agent.allow_multiple_tool_calls)
+        let system_prompt = if let Some(custom_prompt) = custom_system_prompt {
+            // Use custom system prompt (for agent mode)
+            custom_prompt
         } else {
-            // For non-native providers (embedded models), use JSON format instructions
-            SYSTEM_PROMPT_FOR_NON_NATIVE_TOOL_USE.to_string()
+            // Use default system prompt based on provider capabilities
+            if provider_has_native_tool_calling {
+                // For native tool calling providers, use a more explicit system prompt
+                get_system_prompt_for_native(config.agent.allow_multiple_tool_calls)
+            } else {
+                // For non-native providers (embedded models), use JSON format instructions
+                SYSTEM_PROMPT_FOR_NON_NATIVE_TOOL_USE.to_string()
+            }
         };
 
         let system_message = Message::new(MessageRole::System, system_prompt);
@@ -1391,23 +1116,9 @@ impl<W: UiWriter> Agent<W> {
             context_window.add_message(readme_message);
         }
 
-        // Load existing TODO list if present (after system prompt and README)
-        let todo_path = get_todo_path();
-        let initial_todo_content = if todo_path.exists() {
-            std::fs::read_to_string(&todo_path).ok()
-        } else {
-            None
-        };
-
-        if let Some(ref todo_content) = initial_todo_content {
-            if !todo_content.trim().is_empty() {
-                let todo_message = Message::new(
-                    MessageRole::System,
-                    format!("📋 Existing TODO list (from todo.g3.md):\n\n{}", todo_content),
-                );
-                context_window.add_message(todo_message);
-            }
-        }
+        // NOTE: TODO lists are now session-scoped and stored in .g3/sessions/<session_id>/todo.g3.md
+        // We don't load any TODO at initialization since we don't have a session_id yet.
+        // The agent will use todo_read to load the TODO once a session is established.
 
         // Initialize computer controller if enabled
         let computer_controller = if config.computer_control.enabled {
@@ -1437,11 +1148,8 @@ impl<W: UiWriter> Agent<W> {
             session_id: None,
             tool_call_metrics: Vec::new(),
             ui_writer,
-            todo_content: std::sync::Arc::new(tokio::sync::RwLock::new({
-                // Initialize from TODO.md file if it exists
-                let todo_path = get_todo_path();
-                std::fs::read_to_string(&todo_path).unwrap_or_default()
-            })),
+            // TODO content starts empty - session-scoped TODOs are loaded via todo_read
+            todo_content: std::sync::Arc::new(tokio::sync::RwLock::new(String::new())),
             is_autonomous,
             quiet,
             computer_controller,
@@ -1457,6 +1165,11 @@ impl<W: UiWriter> Agent<W> {
             tool_call_count: 0,
             requirements_sha: None,
             working_dir: None,
+            background_process_manager: std::sync::Arc::new(
+                background_process::BackgroundProcessManager::new(
+                    paths::get_logs_dir().join("background_processes")
+                )),
+            pending_images: Vec::new(),
         })
     }
 
@@ -1484,7 +1197,10 @@ impl<W: UiWriter> Agent<W> {
             );
         }
 
-        if !first_message.content.contains("You are G3") {
+        // Check for system prompt markers that are present in both standard and agent mode
+        // Agent mode replaces the identity line but keeps all other instructions
+        let has_tool_instructions = first_message.content.contains("IMPORTANT: You must call tools to achieve goals");
+        if !has_tool_instructions {
             panic!("FATAL: First system message does not contain the system prompt. This likely means the README was added before the system prompt.");
         }
     }
@@ -1703,7 +1419,7 @@ impl<W: UiWriter> Agent<W> {
 
         // Step 1: Try thinnify (first third of context)
         self.ui_writer.print_context_status("🥒 Step 1: Trying thinnify...\n");
-        let (thin_msg, thin_saved) = self.context_window.thin_context();
+        let (thin_msg, thin_saved) = self.context_window.thin_context(self.session_id.as_deref());
         self.thinning_events.push(thin_saved);
         self.ui_writer.print_context_thinning(&thin_msg);
 
@@ -1721,7 +1437,7 @@ impl<W: UiWriter> Agent<W> {
 
         // Step 2: Try skinnify (entire context)
         self.ui_writer.print_context_status("🦴 Step 2: Trying skinnify...\n");
-        let (skinny_msg, skinny_saved) = self.context_window.thin_context_all();
+        let (skinny_msg, skinny_saved) = self.context_window.thin_context_all(self.session_id.as_deref());
         self.thinning_events.push(skinny_saved);
         self.ui_writer.print_context_thinning(&skinny_msg);
 
@@ -1765,7 +1481,7 @@ impl<W: UiWriter> Agent<W> {
 
         // Step 1: Try thinnify (first third of context)
         self.ui_writer.print_context_status("🥒 Step 1: Trying thinnify...\n");
-        let (thin_msg, thin_saved) = self.context_window.thin_context();
+        let (thin_msg, thin_saved) = self.context_window.thin_context(self.session_id.as_deref());
         self.thinning_events.push(thin_saved);
         self.ui_writer.print_context_thinning(&thin_msg);
 
@@ -1782,7 +1498,7 @@ impl<W: UiWriter> Agent<W> {
 
         // Step 2: Try skinnify (entire context)
         self.ui_writer.print_context_status("🦴 Step 2: Trying skinnify...\n");
-        let (skinny_msg, skinny_saved) = self.context_window.thin_context_all();
+        let (skinny_msg, skinny_saved) = self.context_window.thin_context_all(self.session_id.as_deref());
         self.thinning_events.push(skinny_saved);
         self.ui_writer.print_context_thinning(&skinny_msg);
 
@@ -1944,60 +1660,6 @@ impl<W: UiWriter> Agent<W> {
         Ok(context_length)
     }
 
-    fn tool_log_handle() -> Option<&'static Mutex<std::fs::File>> {
-        static TOOL_LOG: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
-
-        TOOL_LOG
-            .get_or_init(|| {
-                let logs_dir = get_logs_dir();
-                if let Err(e) = std::fs::create_dir_all(&logs_dir) {
-                    error!("Failed to create logs directory for tool log: {}", e);
-                    return None;
-                }
-
-                let ts = Local::now().format("%Y%m%d_%H%M%S").to_string();
-                let path = logs_dir.join(format!("tool_calls_{}.log", ts));
-
-                match OpenOptions::new().create(true).append(true).open(&path) {
-                    Ok(file) => Some(Mutex::new(file)),
-                    Err(e) => {
-                        error!("Failed to open tool log file {:?}: {}", path, e);
-                        None
-                    }
-                }
-            })
-            .as_ref()
-    }
-
-    fn log_tool_call(&self, tool_call: &ToolCall, response: &str) {
-        if let Some(handle) = Self::tool_log_handle() {
-            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            let args_str = serde_json::to_string(&tool_call.args)
-                .unwrap_or_else(|_| "<unserializable>".to_string());
-
-            fn sanitize(s: &str) -> String {
-                s.replace('\n', "\\n")
-            }
-            fn truncate(s: &str, limit: usize) -> String {
-                s.chars().take(limit).collect()
-            }
-
-            let args_snippet = truncate(&sanitize(&args_str), 80);
-            let response_snippet = truncate(&sanitize(response), 80);
-
-            let tool_field = format!("{:<15}", tool_call.tool);
-            let line = format!(
-                "{}  {}  {} 🟩 {}\n",
-                timestamp, tool_field, args_snippet, response_snippet
-            );
-
-            if let Ok(mut file) = handle.lock() {
-                let _ = file.write_all(line.as_bytes());
-                let _ = file.flush();
-            }
-        }
-    }
-
     pub fn get_provider_info(&self) -> Result<(String, String)> {
         let provider = self.providers.get(None)?;
         Ok((provider.name().to_string(), provider.model().to_string()))
@@ -2104,7 +1766,7 @@ impl<W: UiWriter> Agent<W> {
     ) -> Result<TaskResult> {
         // Reset the JSON tool call filter state at the start of each new task
         // This prevents the filter from staying in suppression mode between user interactions
-        fixed_filter_json::reset_fixed_json_tool_state();
+        self.ui_writer.reset_json_filter();
 
         // Validate that the system prompt is the first message (critical invariant)
         self.validate_system_prompt_is_first();
@@ -2115,7 +1777,7 @@ impl<W: UiWriter> Agent<W> {
         }
 
         // Add user message to context window
-        let user_message = {
+        let mut user_message = {
             // Check if we should use cache control (every 10 tool calls)
             // But only if we haven't already added 4 cache_control annotations
             let provider = self.providers.get(None)?;
@@ -2143,6 +1805,12 @@ impl<W: UiWriter> Agent<W> {
                 Message::new(MessageRole::User, format!("Task: {}", description))
             }
         };
+        
+        // Attach any pending images to this user message
+        if !self.pending_images.is_empty() {
+            user_message.images = std::mem::take(&mut self.pending_images);
+        }
+        
         self.context_window.add_message(user_message);
 
         // Execute fast-discovery tool calls if provided (immediately after user message)
@@ -2319,19 +1987,21 @@ impl<W: UiWriter> Agent<W> {
             .unwrap_or_default()
             .as_secs();
 
-        // Create logs directory if it doesn't exist
-        let logs_dir = get_logs_dir();
-        if !logs_dir.exists() {
+        // Use new .g3/session/<session_id>/ structure if we have a session ID
+        let filename = if let Some(ref session_id) = self.session_id {
+            // Ensure session directory exists
+            if let Err(e) = ensure_session_dir(session_id) {
+                error!("Failed to create session directory: {}", e);
+                return;
+            }
+            get_session_file(session_id)
+        } else {
+            // Fallback to old logs/ directory for sessions without ID
+            let logs_dir = get_logs_dir();
             if let Err(e) = std::fs::create_dir_all(&logs_dir) {
                 error!("Failed to create logs directory: {}", e);
                 return;
             }
-        }
-
-        // Use session-based filename if we have a session ID, otherwise fall back to timestamp
-        let filename = if let Some(ref session_id) = self.session_id {
-            logs_dir.join(format!("g3_session_{}.json", session_id))
-        } else {
             logs_dir.join(format!("g3_context_{}.json", timestamp))
         };
 
@@ -2407,18 +2077,15 @@ impl<W: UiWriter> Agent<W> {
             None => return,
         };
 
-        // Create logs directory if it doesn't exist
-        let logs_dir = get_logs_dir();
-        if !logs_dir.exists() {
-            if let Err(e) = std::fs::create_dir_all(&logs_dir) {
-                error!("Failed to create logs directory: {}", e);
-                return;
-            }
+        // Ensure session directory exists
+        if let Err(e) = ensure_session_dir(session_id) {
+            error!("Failed to create session directory: {}", e);
+            return;
         }
 
-        // Generate filename using same pattern as save_context_window
-        let filename = logs_dir.join(format!("context_window_{}.txt", session_id));
-        let symlink_path = logs_dir.join("current_context_window");
+        // Use new .g3/session/<session_id>/ structure
+        let filename = get_context_summary_file(session_id);
+        let symlink_path = get_g3_dir().join("sessions").join("current_context_window");
 
         // Build the summary content
         let mut summary_lines = Vec::new();
@@ -2610,7 +2277,7 @@ impl<W: UiWriter> Agent<W> {
     /// Manually trigger context summarization regardless of context window size
     /// Returns Ok(true) if summarization was successful, Ok(false) if it failed
     pub async fn force_summarize(&mut self) -> Result<bool> {
-        info!("Manual summarization triggered");
+        debug!("Manual summarization triggered");
 
         self.ui_writer.print_context_status(&format!(
             "\n🗜️ Manual summarization requested (current usage: {}%)...",
@@ -2728,8 +2395,8 @@ impl<W: UiWriter> Agent<W> {
 
     /// Manually trigger context thinning regardless of thresholds
     pub fn force_thin(&mut self) -> String {
-        info!("Manual context thinning triggered");
-        let (message, chars_saved) = self.context_window.thin_context();
+        debug!("Manual context thinning triggered");
+        let (message, chars_saved) = self.context_window.thin_context(self.session_id.as_deref());
         self.thinning_events.push(chars_saved);
         message
     }
@@ -2737,8 +2404,8 @@ impl<W: UiWriter> Agent<W> {
     /// Manually trigger context thinning for the ENTIRE context window
     /// Unlike force_thin which only processes the first third, this processes all messages
     pub fn force_thin_all(&mut self) -> String {
-        info!("Manual full context skinnifying triggered");
-        let (message, chars_saved) = self.context_window.thin_context_all();
+        debug!("Manual full context skinnifying triggered");
+        let (message, chars_saved) = self.context_window.thin_context_all(self.session_id.as_deref());
         self.thinning_events.push(chars_saved);
         message
     }
@@ -2746,7 +2413,7 @@ impl<W: UiWriter> Agent<W> {
     /// Reload README.md and AGENTS.md and replace the first system message
     /// Returns Ok(true) if README was found and reloaded, Ok(false) if no README was present initially
     pub fn reload_readme(&mut self) -> Result<bool> {
-        info!("Manual README reload triggered");
+        debug!("Manual README reload triggered");
 
         // Check if the second message in conversation history is a system message with README content
         // (The first message should always be the system prompt)
@@ -2789,7 +2456,7 @@ impl<W: UiWriter> Agent<W> {
             // Replace the second message (README) with the new content
             if let Some(first_msg) = self.context_window.conversation_history.get_mut(1) {
                 first_msg.content = combined_content;
-                info!("README content reloaded successfully");
+                debug!("README content reloaded successfully");
                 Ok(true)
             } else {
                 Ok(false)
@@ -2971,6 +2638,134 @@ impl<W: UiWriter> Agent<W> {
         self.requirements_sha = Some(sha);
     }
 
+    /// Save a session continuation artifact
+    /// Called when final_output is invoked to enable session resumption
+    pub fn save_session_continuation(&self, final_output_summary: Option<String>) {
+        use crate::session_continuation::{save_continuation, SessionContinuation};
+        
+        let session_id = match &self.session_id {
+            Some(id) => id.clone(),
+            None => {
+                debug!("No session ID, skipping continuation save");
+                return;
+            }
+        };
+        
+        // Get the session log path (now in .g3/sessions/<session_id>/session.json)
+        let session_log_path = get_session_file(&session_id);
+        
+        // Get current TODO content
+        let todo_snapshot = std::fs::read_to_string(get_todo_path()).ok();
+        
+        // Get working directory
+        let working_directory = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+        
+        let continuation = SessionContinuation::new(
+            session_id,
+            final_output_summary,
+            session_log_path.to_string_lossy().to_string(),
+            self.context_window.percentage_used(),
+            todo_snapshot,
+            working_directory,
+        );
+        
+        if let Err(e) = save_continuation(&continuation) {
+            error!("Failed to save session continuation: {}", e);
+        } else {
+            debug!("Saved session continuation artifact");
+        }
+    }
+    
+    /// Clear session state and continuation artifacts (for /clear command)
+    pub fn clear_session(&mut self) {
+        use crate::session_continuation::clear_continuation;
+        
+        // Clear the context window (keep system prompt)
+        self.context_window.clear_conversation();
+        
+        // Clear continuation artifacts
+        if let Err(e) = clear_continuation() {
+            error!("Failed to clear continuation artifacts: {}", e);
+        }
+        
+        debug!("Session cleared");
+    }
+
+    /// Restore session from a continuation artifact
+    /// Returns true if full context was restored, false if only summary was used
+    pub fn restore_from_continuation(
+        &mut self,
+        continuation: &crate::session_continuation::SessionContinuation,
+    ) -> Result<bool> {
+        use std::path::PathBuf;
+        
+        let session_log_path = PathBuf::from(&continuation.session_log_path);
+        
+        // If context < 80%, try to restore full context
+        if continuation.can_restore_full_context() && session_log_path.exists() {
+            // Load the session log
+            let json = std::fs::read_to_string(&session_log_path)?;
+            let session_data: serde_json::Value = serde_json::from_str(&json)?;
+            
+            // Extract conversation history
+            if let Some(context_window) = session_data.get("context_window") {
+                if let Some(history) = context_window.get("conversation_history") {
+                    if let Some(messages) = history.as_array() {
+                        // Clear current conversation (keep system messages)
+                        self.context_window.clear_conversation();
+                        
+                        // Restore messages from session log (skip system messages as they're preserved)
+                        for msg in messages {
+                            let role_str = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                            let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                            
+                            let role = match role_str {
+                                "system" => continue, // Skip system messages, already preserved
+                                "assistant" => MessageRole::Assistant,
+                                _ => MessageRole::User,
+                            };
+                            
+                            self.context_window.add_message(Message {
+                                role,
+                                id: String::new(),
+                                images: Vec::new(),
+                                content: content.to_string(),
+                                cache_control: None,
+                            });
+                        }
+                        
+                        debug!("Restored full context from session log");
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        
+        // Fall back to using final_output summary + TODO
+        let mut context_msg = String::new();
+        if let Some(ref summary) = continuation.final_output_summary {
+            context_msg.push_str(&format!("Previous session summary:\n{}\n\n", summary));
+        }
+        if let Some(ref todo) = continuation.todo_snapshot {
+            context_msg.push_str(&format!("Current TODO state:\n{}\n", todo));
+        }
+        
+        if !context_msg.is_empty() {
+            self.context_window.add_message(Message {
+                role: MessageRole::User,
+                id: String::new(),
+                images: Vec::new(),
+                content: format!("[Session Resumed]\n\n{}", context_msg),
+                cache_control: None,
+            });
+        }
+        
+        debug!("Restored session from summary");
+        Ok(false)
+    }
+
     async fn stream_completion(
         &mut self,
         request: CompletionRequest,
@@ -2996,13 +2791,31 @@ impl<W: UiWriter> Agent<W> {
                         "command": {
                             "type": "string",
                             "description": "The shell command to execute"
-                        },
-                        "timeout": {
-                            "type": "integer",
-                            "description": "Optional idle timeout in seconds. If the command produces no output for this duration, it will be terminated. Default: 60 seconds."
                         }
                     },
                     "required": ["command"]
+                }),
+            },
+            Tool {
+                name: "background_process".to_string(),
+                description: "Launch a long-running process in the background (e.g., game servers, dev servers). The process runs independently and logs are captured to a file. Use the regular 'shell' tool to read logs (cat/tail), check status (ps), or stop the process (kill). Returns the PID and log file path.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "A unique name for this process (e.g., 'game_server', 'my_app'). Used to identify the process and its log file."
+                        },
+                        "command": {
+                            "type": "string",
+                            "description": "The shell command to execute in the background"
+                        },
+                        "working_dir": {
+                            "type": "string",
+                            "description": "Optional working directory. Defaults to current directory if not specified."
+                        }
+                    },
+                    "required": ["name", "command"]
                 }),
             },
             Tool {
@@ -3025,6 +2838,21 @@ impl<W: UiWriter> Agent<W> {
                         }
                     },
                     "required": ["file_path"]
+                }),
+            },
+            Tool {
+                name: "read_image".to_string(),
+                description: "Read one or more image files and send them to the LLM for visual analysis. Supports PNG, JPEG, GIF, and WebP formats. Use this when you need to visually inspect images (e.g., find sprites, analyze UI, read diagrams). The images will be included in your next response for analysis.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "file_paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Array of paths to image files to read"
+                        }
+                    },
+                    "required": ["file_paths"]
                 }),
             },
             Tool {
@@ -3127,7 +2955,7 @@ impl<W: UiWriter> Agent<W> {
             },
             Tool {
                 name: "todo_read".to_string(),
-                description: "Read your current TODO list from todo.g3.md file in the workspace directory. Shows what tasks are planned and their status. Call this at the start of multi-step tasks to check for existing plans, and during execution to review progress before updating. TODO lists persist across g3 sessions.".to_string(),
+                description: "Read your current TODO list from todo.g3.md file in the session directory. Shows what tasks are planned and their status. Call this at the start of multi-step tasks to check for existing plans, and during execution to review progress before updating. TODO lists are scoped to the current session.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {},
@@ -3136,7 +2964,7 @@ impl<W: UiWriter> Agent<W> {
             },
             Tool {
                 name: "todo_write".to_string(),
-                description: "Create or update your TODO list in todo.g3.md file with a complete task plan. Use markdown checkboxes: - [ ] for pending, - [x] for complete. This tool replaces the entire file content, so always call todo_read first to preserve existing content. Essential for multi-step tasks. Changes persist across g3 sessions.".to_string(),
+                description: "Create or update your TODO list in todo.g3.md file with a complete task plan. Use markdown checkboxes: - [ ] for pending, - [x] for complete. This tool replaces the entire file content, so always call todo_read first to preserve existing content. Essential for multi-step tasks. TODO lists are scoped to the current session.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -3581,7 +3409,7 @@ impl<W: UiWriter> Agent<W> {
             match provider.stream(request.clone()).await {
                 Ok(stream) => {
                     if attempt > 1 {
-                        info!("Stream started successfully after {} attempts", attempt);
+                        debug!("Stream started successfully after {} attempts", attempt);
                     }
                     debug!("Stream started successfully");
                     debug!(
@@ -3631,9 +3459,10 @@ impl<W: UiWriter> Agent<W> {
         let mut response_started = false;
         let mut any_tool_executed = false; // Track if ANY tool was executed across all iterations
         let mut auto_summary_attempts = 0; // Track auto-summary prompt attempts
-        const MAX_AUTO_SUMMARY_ATTEMPTS: usize = 2; // Limit auto-summary retries
-        let mut last_action_was_tool = false; // Track if the last action was a tool call (vs text response)
-        let mut any_text_response = false; // Track if LLM ever provided a text response
+        const MAX_AUTO_SUMMARY_ATTEMPTS: usize = 5; // Limit auto-summary retries (increased from 2 for better recovery)
+        let final_output_called = false; // Track if final_output was called
+        // Note: Session-level duplicate tracking was removed - we only prevent sequential duplicates (DUP IN CHUNK, DUP IN MSG)
+        let mut turn_accumulated_usage: Option<g3_providers::Usage> = None; // Track token usage for timing footer
 
         // Check if we need to summarize before starting
         if self.context_window.should_summarize() {
@@ -3644,7 +3473,7 @@ impl<W: UiWriter> Agent<W> {
                     self.context_window.percentage_used() as u32
                 ));
 
-                let (thin_summary, chars_saved) = self.context_window.thin_context();
+                let (thin_summary, chars_saved) = self.context_window.thin_context(self.session_id.as_deref());
                 self.thinning_events.push(chars_saved);
                 self.ui_writer.print_context_thinning(&thin_summary);
 
@@ -3879,6 +3708,7 @@ impl<W: UiWriter> Agent<W> {
                         // Capture usage data if available
                         if let Some(ref usage) = chunk.usage {
                             accumulated_usage = Some(usage.clone());
+                            turn_accumulated_usage = Some(usage.clone());
                             debug!(
                                 "Received usage data - prompt: {}, completion: {}, total: {}",
                                 usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
@@ -3934,77 +3764,51 @@ impl<W: UiWriter> Agent<W> {
                         };
 
                         // De-duplicate tool calls and track duplicates
-                        let mut seen_in_chunk: Vec<ToolCall> = Vec::new();
+                        let mut last_tool_in_chunk: Option<ToolCall> = None;
                         let mut deduplicated_tools: Vec<(ToolCall, Option<String>)> = Vec::new();
 
                         for tool_call in tools_to_process {
                             let mut duplicate_type = None;
 
-                            // Check for duplicates in current chunk
-                            if seen_in_chunk
-                                .iter()
-                                .any(|tc| are_duplicates(tc, &tool_call))
-                            {
+                            // Check for IMMEDIATELY SEQUENTIAL duplicate in current chunk
+                            // Only the immediately previous tool call counts as a duplicate
+                            if let Some(ref last_tool) = last_tool_in_chunk {
+                                if are_duplicates(last_tool, &tool_call) {
                                 duplicate_type = Some("DUP IN CHUNK".to_string());
+                                }
                             } else {
-                                // Check for duplicate against previous message in history
-                                // Look at the last assistant message that contains tool calls
+                                // Check for IMMEDIATELY SEQUENTIAL duplicate against previous message
+                                // Only mark as duplicate if the LAST tool call in the previous message
+                                // matches AND there's no significant text after it
                                 let mut found_in_prev = false;
                                 for msg in self.context_window.conversation_history.iter().rev() {
                                     if matches!(msg.role, MessageRole::Assistant) {
-                                        // Try to parse tool calls from the message content
-                                        if msg.content.contains(r#"\"tool\""#) {
-                                            // Simple JSON extraction for tool calls
-                                            let content = &msg.content;
-                                            let mut start_idx = 0;
-                                            while let Some(tool_start) =
-                                                content[start_idx..].find(r#"{\"tool\""#)
-                                            {
-                                                let tool_start = start_idx + tool_start;
-                                                // Find the end of this JSON object
-                                                let mut brace_count = 0;
-                                                let mut in_string = false;
-                                                let mut escape_next = false;
-                                                let mut end_idx = tool_start;
-
-                                                for (i, ch) in content[tool_start..].char_indices()
-                                                {
-                                                    if escape_next {
-                                                        escape_next = false;
-                                                        continue;
-                                                    }
-                                                    if ch == '\\' && in_string {
-                                                        escape_next = true;
-                                                        continue;
-                                                    }
-                                                    if ch == '"' && !escape_next {
-                                                        in_string = !in_string;
-                                                    }
-                                                    if !in_string {
-                                                        if ch == '{' {
-                                                            brace_count += 1;
-                                                        } else if ch == '}' {
-                                                            brace_count -= 1;
-                                                            if brace_count == 0 {
-                                                                end_idx = tool_start + i + 1;
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-
-                                                if end_idx > tool_start {
-                                                    let tool_json = &content[tool_start..end_idx];
-                                                    if let Ok(prev_tool) =
-                                                        serde_json::from_str::<ToolCall>(tool_json)
-                                                    {
+                                        // Find the LAST tool call in the message
+                                        let content = &msg.content;
+                                        
+                                        // Look for the last occurrence of a tool call pattern
+                                        if let Some(last_tool_start) = content.rfind(r#"{"tool""#)
+                                            .or_else(|| content.rfind(r#"{ "tool""#))
+                                        {
+                                            // Find the end of this JSON object
+                                            if let Some(end_offset) = StreamingToolParser::find_complete_json_object_end(&content[last_tool_start..]) {
+                                                let end_idx = last_tool_start + end_offset + 1;
+                                                let tool_json = &content[last_tool_start..end_idx];
+                                                
+                                                // Check if there's any non-whitespace text after this tool call
+                                                let text_after = content[end_idx..].trim();
+                                                let has_text_after = !text_after.is_empty();
+                                                
+                                                // Only consider it a duplicate if:
+                                                // 1. The tool call matches
+                                                // 2. There's no text after it (it was the last thing in the message)
+                                                if !has_text_after {
+                                                    if let Ok(prev_tool) = serde_json::from_str::<ToolCall>(tool_json) {
                                                         if are_duplicates(&prev_tool, &tool_call) {
                                                             found_in_prev = true;
-                                                            break;
                                                         }
                                                     }
                                                 }
-                                                start_idx = end_idx;
                                             }
                                         }
                                         // Only check the most recent assistant message
@@ -4017,13 +3821,8 @@ impl<W: UiWriter> Agent<W> {
                                 }
                             }
 
-                            // Add to seen list if not a duplicate in chunk
-                            if duplicate_type
-                                .as_ref()
-                                .map_or(true, |s| s != "DUP IN CHUNK")
-                            {
-                                seen_in_chunk.push(tool_call.clone());
-                            }
+                            // Track the last tool call for sequential duplicate detection
+                            last_tool_in_chunk = Some(tool_call.clone());
 
                             deduplicated_tools.push((tool_call, duplicate_type));
                         }
@@ -4031,8 +3830,10 @@ impl<W: UiWriter> Agent<W> {
                         // Process each tool call
                         for (tool_call, duplicate_type) in deduplicated_tools {
                             debug!("Processing completed tool call: {:?}", tool_call);
-
-                            // If it's a duplicate, log it and return a warning
+                            
+                            // If it's a duplicate, log it and skip - don't set tool_executed!
+                            // Setting tool_executed for duplicates would trigger auto-continue
+                            // even when no actual tool execution occurred.
                             if let Some(dup_type) = &duplicate_type {
                                 // Log the duplicate with red prefix
                                 let prefixed_tool_name =
@@ -4047,9 +3848,18 @@ impl<W: UiWriter> Agent<W> {
                                 // Log to tool log with red prefix
                                 let mut modified_tool_call = tool_call.clone();
                                 modified_tool_call.tool = prefixed_tool_name;
-                                self.log_tool_call(&modified_tool_call, &warning_msg);
+                                debug!("{}", warning_msg);
+
+                                // Reset the parser to clear any partial/polluted state.
+                                // This prevents "example" tool calls in markdown or LLM stuttering
+                                // from polluting subsequent parsing.
+                                parser.reset();
+
                                 continue; // Skip execution of duplicate
                             }
+
+                            // Mark that we're executing a tool (only for non-duplicates)
+                            tool_executed = true;
 
                             // Check if we should auto-compact at 90% BEFORE executing the tool
                             // We need to do this before any borrows of self
@@ -4062,7 +3872,7 @@ impl<W: UiWriter> Agent<W> {
                             // Check if we should thin the context BEFORE executing the tool
                             if self.context_window.should_thin() {
                                 let (thin_summary, chars_saved) =
-                                    self.context_window.thin_context();
+                                    self.context_window.thin_context(self.session_id.as_deref());
                                 self.thinning_events.push(chars_saved);
                                 // Print the thinning summary to the user
                                 self.ui_writer.print_context_thinning(&thin_summary);
@@ -4087,7 +3897,7 @@ impl<W: UiWriter> Agent<W> {
 
                             // Filter out JSON tool calls from the display
                             let filtered_content =
-                                fixed_filter_json::fixed_filter_json_tool_calls(&clean_content);
+                                self.ui_writer.filter_json_tool_calls(&clean_content);
                             let final_display_content = filtered_content.trim();
 
                             // Display any new content before tool execution
@@ -4263,7 +4073,7 @@ impl<W: UiWriter> Agent<W> {
                                     ),
                                 )
                             };
-                            let result_message = {
+                            let mut result_message = {
                                 // Check if we should use cache control (every 10 tool calls)
                                 // But only if we haven't already added 4 cache_control annotations
                                 if self.tool_call_count > 0
@@ -4305,6 +4115,15 @@ impl<W: UiWriter> Agent<W> {
                                 }
                             };
 
+                            // Attach any pending images to the result message
+                            // (images loaded via read_image tool)
+                            if !self.pending_images.is_empty() {
+                                result_message.images = std::mem::take(&mut self.pending_images);
+                            }
+
+                            // Track tokens before adding messages
+                            let tokens_before = self.context_window.used_tokens;
+
                             self.context_window.add_message(tool_message);
                             self.context_window.add_message(result_message);
 
@@ -4339,8 +4158,11 @@ impl<W: UiWriter> Agent<W> {
 
                             // Closure marker with timing
                             if tool_call.tool != "final_output" {
+                                let tokens_delta = self.context_window.used_tokens.saturating_sub(tokens_before);
                                 self.ui_writer
-                                    .print_tool_timing(&Self::format_duration(exec_duration));
+                                    .print_tool_timing(&Self::format_duration(exec_duration),
+                                        tokens_delta,
+                                        self.context_window.percentage_used());
                                 self.ui_writer.print_agent_prompt();
                             }
 
@@ -4366,14 +4188,26 @@ impl<W: UiWriter> Agent<W> {
 
                             tool_executed = true;
                             any_tool_executed = true; // Track across all iterations
-                            last_action_was_tool = true; // Last action was a tool call
+
+                            // Reset auto-continue attempts after successful tool execution
+                            // This gives the LLM fresh attempts since it's making progress
+                            auto_summary_attempts = 0;
+
 
                             // Reset the JSON tool call filter state after each tool execution
                             // This ensures the filter doesn't stay in suppression mode for subsequent streaming content
-                            fixed_filter_json::reset_fixed_json_tool_state();
+                            self.ui_writer.reset_json_filter();
 
-                            // Reset parser for next iteration - this clears the text buffer
-                            parser.reset();
+                            // Only reset parser if there are no more unexecuted tool calls in the buffer
+                            // This handles the case where the LLM emits multiple tool calls in one response
+                            if parser.has_unexecuted_tool_call() {
+                                debug!("Parser still has unexecuted tool calls, not resetting buffer");
+                                // Mark current tool as consumed so we don't re-detect it
+                                parser.mark_tool_calls_consumed();
+                            } else {
+                                // Reset parser for next iteration - this clears the text buffer
+                                parser.reset();
+                            }
 
                             // Clear current_response for next iteration to prevent buffered text
                             // from being incorrectly displayed after tool execution
@@ -4388,8 +4222,14 @@ impl<W: UiWriter> Agent<W> {
                         } // End of for loop processing each tool call
 
                         // If we processed any tools in multiple mode, break out to start new stream
+                        // BUT only if there are no more unexecuted tool calls in the buffer
                         if tool_executed && self.config.agent.allow_multiple_tool_calls {
-                            break;
+                            if parser.has_unexecuted_tool_call() {
+                                debug!("Tool executed but parser still has unexecuted tool calls, continuing to process");
+                                // Don't break - continue processing to pick up remaining tool calls
+                            } else {
+                                break;
+                            }
                         }
 
                         // If no tool calls were completed, continue streaming normally
@@ -4403,7 +4243,7 @@ impl<W: UiWriter> Agent<W> {
 
                             if !clean_content.is_empty() {
                                 let filtered_content =
-                                    fixed_filter_json::fixed_filter_json_tool_calls(&clean_content);
+                                    self.ui_writer.filter_json_tool_calls(&clean_content);
 
                                 if !filtered_content.is_empty() {
                                     if !response_started {
@@ -4414,8 +4254,11 @@ impl<W: UiWriter> Agent<W> {
                                     self.ui_writer.print_agent_response(&filtered_content);
                                     self.ui_writer.flush();
                                     current_response.push_str(&filtered_content);
-                                    last_action_was_tool = false; // Text response received
-                                    any_text_response = true;
+
+                                    // Mark parser buffer as consumed up to current position
+                                    // This prevents tool-call-like patterns in displayed text
+                                    // from triggering false positives in has_unexecuted_tool_call()
+                                    parser.mark_tool_calls_consumed();
                                 }
                             }
                         }
@@ -4450,9 +4293,7 @@ impl<W: UiWriter> Agent<W> {
                                         .replace("<</SYS>>", "");
 
                                     let filtered_text =
-                                        fixed_filter_json::fixed_filter_json_tool_calls(
-                                            &clean_text,
-                                        );
+                                        self.ui_writer.filter_json_tool_calls(&clean_text);
 
                                     // Only use this if we truly have nothing else
                                     if !filtered_text.trim().is_empty() && full_response.is_empty()
@@ -4483,10 +4324,10 @@ impl<W: UiWriter> Agent<W> {
                                         "  - Text buffer content: {:?}",
                                         parser.get_text_content()
                                     );
-                                    error!("  - Native tool calls: {:?}", parser.native_tool_calls);
+                                    error!("  - Has incomplete tool call: {}", parser.has_incomplete_tool_call());
                                     error!("  - Message stopped: {}", parser.is_message_stopped());
-                                    error!("  - In JSON tool call: {}", parser.in_json_tool_call);
-                                    error!("  - JSON tool start: {:?}", parser.json_tool_start);
+                                    error!("  - In JSON tool call: {}", parser.is_in_json_tool_call());
+                                    error!("  - JSON tool start: {:?}", parser.json_tool_start_position());
                                     error!("Request details:");
                                     error!("  - Messages count: {}", request.messages.len());
                                     error!("  - Has tools: {}", request.tools.is_some());
@@ -4561,6 +4402,18 @@ impl<W: UiWriter> Agent<W> {
                                     ));
                                 }
 
+                                // If tools were executed in previous iterations but final_output wasn't called,
+                                // break to let the outer loop's auto-continue logic handle it
+                                if any_tool_executed && !final_output_called {
+                                    debug!("Tools were executed but final_output not called - breaking to auto-continue");
+                                    // NOTE: We intentionally do NOT set full_response here.
+                                    // The content was already displayed during streaming.
+                                    // Setting full_response would cause duplication when the
+                                    // function eventually returns.
+                                    // Context window is updated separately via add_message().
+                                    break;
+                                }
+
                                 // Set full_response to current_response (don't append)
                                 // current_response already contains everything that was displayed
                                 // Don't set full_response here - it would duplicate the output
@@ -4575,11 +4428,17 @@ impl<W: UiWriter> Agent<W> {
 
                                 // Add timing if needed
                                 let final_response = if show_timing {
+                                    let turn_tokens = turn_accumulated_usage.as_ref().map(|u| u.total_tokens);
+                                    let timing_footer = Self::format_timing_footer(
+                                        stream_start.elapsed(),
+                                        _ttft,
+                                        turn_tokens,
+                                        self.context_window.percentage_used(),
+                                    );
                                     format!(
-                                        "{}\n\n⏱️ {} | 💭 {}",
+                                        "{}\n\n{}",
                                         full_response,
-                                        Self::format_duration(stream_start.elapsed()),
-                                        Self::format_duration(_ttft)
+                                        timing_footer
                                     )
                                 } else {
                                     full_response
@@ -4603,8 +4462,8 @@ impl<W: UiWriter> Agent<W> {
                         );
 
                         error!("Error type: {}", std::any::type_name_of_val(&e));
-                        error!("Parser state at error: text_buffer_len={}, native_tool_calls={}, message_stopped={}",
-                            parser.text_buffer_len(), parser.native_tool_calls.len(), parser.is_message_stopped());
+                        error!("Parser state at error: text_buffer_len={}, has_incomplete={}, message_stopped={}",
+                            parser.text_buffer_len(), parser.has_incomplete_tool_call(), parser.is_message_stopped());
 
                         // Store the error for potential logging later
                         _last_error = Some(error_details.clone());
@@ -4623,7 +4482,7 @@ impl<W: UiWriter> Agent<W> {
                             // If we have any content or tool calls, treat this as a graceful end
                             if chunks_received > 0
                                 && (!parser.get_text_content().is_empty()
-                                    || parser.native_tool_calls.len() > 0)
+                                    || parser.has_unexecuted_tool_call())
                             {
                                 warn!("Stream terminated unexpectedly but we have content, continuing");
                                 break; // Break to process what we have
@@ -4671,59 +4530,138 @@ impl<W: UiWriter> Agent<W> {
 
                 let has_response = !current_response.is_empty() || !full_response.is_empty();
 
-                if !has_response {
-                    if any_tool_executed && last_action_was_tool && !any_text_response {
-                        // Only auto-prompt for summary if:
-                        // 1. Tools were executed in previous iterations
-                        // 2. The last action was a tool call (not a text response)
-                        // 3. No text response was ever provided by the LLM
-                        if auto_summary_attempts < MAX_AUTO_SUMMARY_ATTEMPTS {
-                            // Auto-prompt for a summary by adding a follow-up message
-                            auto_summary_attempts += 1;
+                // Check if the response is essentially empty (just whitespace or timing lines)
+                // This detects cases where the LLM outputs nothing substantive
+                let response_text = if !current_response.is_empty() {
+                    &current_response
+                } else {
+                    &full_response
+                };
+                let is_empty_response = response_text.trim().is_empty() 
+                    || response_text.lines().all(|line| line.trim().is_empty() || line.trim().starts_with("⏱️"));
+
+                // Check if there's an incomplete tool call in the buffer
+                let has_incomplete_tool_call = parser.has_incomplete_tool_call();
+
+                // Check if there's a complete but unexecuted tool call in the buffer
+                let has_unexecuted_tool_call = parser.has_unexecuted_tool_call();
+
+                // Log when we detect unexecuted or incomplete tool calls for debugging
+                if has_incomplete_tool_call {
+                    debug!("Detected incomplete tool call in buffer (buffer_len={}, consumed_up_to={})",
+                        parser.text_buffer_len(), parser.text_buffer_len());
+                }
+                if has_unexecuted_tool_call {
+                    debug!("Detected unexecuted tool call in buffer - this may indicate a parsing issue");
+                    warn!("Unexecuted tool call detected in buffer after stream ended");
+                }
+
+                // Auto-continue if tools were executed but final_output was never called
+                // OR if the LLM emitted an incomplete tool call (truncated JSON)
+                // OR if the LLM emitted a complete tool call that wasn't executed
+                // This ensures we don't return control when the LLM clearly intended to call a tool
+                // Note: We removed the redundant condition (any_tool_executed && is_empty_response)
+                // because it's already covered by (any_tool_executed && !final_output_called)
+                let should_auto_continue = (any_tool_executed && !final_output_called) 
+                    || has_incomplete_tool_call 
+                    || has_unexecuted_tool_call;
+                if should_auto_continue {
+                    if auto_summary_attempts < MAX_AUTO_SUMMARY_ATTEMPTS {
+                        auto_summary_attempts += 1;
+                        if has_incomplete_tool_call {
                             warn!(
-                                "LLM stopped without final response after executing tools ({} iterations, auto-summary attempt {})",
-                                iteration_count, auto_summary_attempts
+                                "LLM emitted incomplete tool call ({} iterations, auto-continue attempt {}/{})",
+                                iteration_count, auto_summary_attempts, MAX_AUTO_SUMMARY_ATTEMPTS
                             );
                             self.ui_writer.print_context_status(
-                                "\n🔄 Model stopped without response. Auto-prompting for summary...\n"
+                                "\n🔄 Model emitted incomplete tool call. Auto-continuing...\n"
                             );
-                            
-                            // Add a follow-up message asking for summary
-                            let summary_prompt = Message::new(
-                                MessageRole::User,
-                                "Please provide a brief summary of what was accomplished and any next steps.".to_string(),
-                            );
-                            self.context_window.add_message(summary_prompt);
-                            request.messages = self.context_window.conversation_history.clone();
-                            
-                            // Continue the loop to get the summary
-                            continue;
-                        } else {
-                            // Max auto-summary attempts reached, give up gracefully
+                        } else if has_unexecuted_tool_call {
                             warn!(
-                                "Max auto-summary attempts ({}) reached, returning without summary",
-                                MAX_AUTO_SUMMARY_ATTEMPTS
+                                "LLM emitted unexecuted tool call ({} iterations, auto-continue attempt {}/{})",
+                                iteration_count, auto_summary_attempts, MAX_AUTO_SUMMARY_ATTEMPTS
                             );
-                            self.ui_writer.print_agent_response(
-                                "\n⚠️ The model stopped without providing a final response after multiple attempts.\n"
+                            self.ui_writer.print_context_status(
+                                "\n🔄 Model emitted tool call that wasn't executed. Auto-continuing...\n"
+                            );
+                        } else if is_empty_response {
+                            warn!(
+                                "LLM emitted empty/trivial response ({} iterations, auto-continue attempt {}/{})",
+                                iteration_count, auto_summary_attempts, MAX_AUTO_SUMMARY_ATTEMPTS
+                            );
+                            self.ui_writer.print_context_status(
+                                "\n🔄 Model emitted empty response. Auto-continuing...\n"
+                            );
+                        } else {
+                            warn!(
+                                "LLM stopped without calling final_output after executing tools ({} iterations, auto-continue attempt {}/{})",
+                                iteration_count, auto_summary_attempts, MAX_AUTO_SUMMARY_ATTEMPTS
+                            );
+                            self.ui_writer.print_context_status(
+                                "\n🔄 Model stopped without calling final_output. Auto-continuing...\n"
                             );
                         }
+                        
+                        // Add any text response to context before prompting for continuation
+                        if has_response {
+                            let response_text = if !current_response.is_empty() {
+                                current_response.clone()
+                            } else {
+                                full_response.clone()
+                            };
+                            if !response_text.trim().is_empty() {
+                                let assistant_msg = Message::new(
+                                    MessageRole::Assistant,
+                                    response_text.trim().to_string(),
+                                );
+                                self.context_window.add_message(assistant_msg);
+                            }
+                        }
+                        
+                        // Add a follow-up message asking for continuation
+                        let continue_prompt = if has_incomplete_tool_call {
+                            Message::new(
+                                MessageRole::User,
+                                "Your previous response was cut off mid-tool-call. Please complete the tool call and continue.".to_string(),
+                            )
+                        } else {
+                            Message::new(
+                                MessageRole::User,
+                                "Please continue until you are done. You **MUST** call `final_output` with a summary when done.".to_string(),
+                            )
+                        };
+                        self.context_window.add_message(continue_prompt);
+                        request.messages = self.context_window.conversation_history.clone();
+                        
+                        // Continue the loop
+                        continue;
                     } else {
+                        // Max attempts reached, give up gracefully
                         warn!(
-                            "Loop exited without any response after {} iterations",
-                            iteration_count
+                            "Max auto-continue attempts ({}) reached after {} iterations. Conditions: any_tool_executed={}, final_output_called={}, has_incomplete={}, has_unexecuted={}, is_empty_response={}",
+                            MAX_AUTO_SUMMARY_ATTEMPTS,
+                            iteration_count,
+                            any_tool_executed,
+                            final_output_called,
+                            has_incomplete_tool_call,
+                            has_unexecuted_tool_call,
+                            is_empty_response
+                        );
+                        self.ui_writer.print_agent_response(
+                            &format!("\n⚠️ The model stopped without calling final_output after {} auto-continue attempts.\n", MAX_AUTO_SUMMARY_ATTEMPTS)
                         );
                     }
-                } else {
+                } else if has_response {
                     // Only set full_response if it's empty (first iteration without tools)
                     // This prevents duplication when the agent responds without calling final_output
-                    if full_response.is_empty() && !current_response.is_empty() {
-                        full_response = current_response.clone();
-                        debug!(
-                            "Set full_response from current_response: {} chars",
-                            full_response.len()
-                        );
-                    }
+                    // NOTE: We intentionally do NOT set full_response here anymore.
+                    // The content was already displayed during streaming via print_agent_response().
+                    // Setting full_response would cause the CLI to print it again.
+                    // We only need full_response for the context window (handled separately).
+                    debug!(
+                        "Response already streamed, not setting full_response. current_response: {} chars",
+                        current_response.len()
+                    );
                 }
 
                 let _ttft = first_token_time.unwrap_or_else(|| stream_start.elapsed());
@@ -4750,11 +4688,17 @@ impl<W: UiWriter> Agent<W> {
                 
                 // Add timing if needed
                 let final_response = if show_timing {
+                    let turn_tokens = turn_accumulated_usage.as_ref().map(|u| u.total_tokens);
+                    let timing_footer = Self::format_timing_footer(
+                        stream_start.elapsed(),
+                        _ttft,
+                        turn_tokens,
+                        self.context_window.percentage_used(),
+                    );
                     format!(
-                        "{}\n\n⏱️ {} | 💭 {}",
+                        "{}\n\n{}",
                         full_response,
-                        Self::format_duration(stream_start.elapsed()),
-                        Self::format_duration(_ttft)
+                        timing_footer
                     )
                 } else {
                     full_response
@@ -4771,11 +4715,17 @@ impl<W: UiWriter> Agent<W> {
 
         // Add timing if needed
         let final_response = if show_timing {
+            let turn_tokens = turn_accumulated_usage.as_ref().map(|u| u.total_tokens);
+            let timing_footer = Self::format_timing_footer(
+                stream_start.elapsed(),
+                _ttft,
+                turn_tokens,
+                self.context_window.percentage_used(),
+            );
             format!(
-                "{}\n\n⏱️ {} | 💭 {}",
+                "{}\n\n{}",
                 full_response,
-                Self::format_duration(stream_start.elapsed()),
-                Self::format_duration(_ttft)
+                timing_footer
             )
         } else {
             full_response
@@ -4806,7 +4756,7 @@ impl<W: UiWriter> Agent<W> {
             Ok(s) => s.clone(),
             Err(e) => format!("ERROR: {}", e),
         };
-        self.log_tool_call(tool_call, &log_str);
+        debug!("Tool {} completed: {}", tool_call.tool, &log_str.chars().take(100).collect::<String>());
         result
     }
 
@@ -4836,16 +4786,12 @@ impl<W: UiWriter> Agent<W> {
                     debug!("Found command parameter: {:?}", command);
                     if let Some(command_str) = command.as_str() {
                         debug!("Command string: {}", command_str);
+                        // Use shell escaping to handle filenames with spaces and special characters
                         let escaped_command = shell_escape_command(command_str);
-
-                        // Read optional timeout parameter (default: 60 seconds)
-                        let idle_timeout = tool_call.args
-                            .get("timeout")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(60);
 
                         let executor = CodeExecutor::new();
 
+                        // Create a receiver for streaming output
                         struct ToolOutputReceiver<'a, W: UiWriter> {
                             ui_writer: &'a W,
                         }
@@ -4860,18 +4806,10 @@ impl<W: UiWriter> Agent<W> {
                             ui_writer: &self.ui_writer,
                         };
 
-                        debug!(
-                            "Calling execute_bash_streaming_with_idle_timeout: cmd='{}', dir={:?}, timeout={}s",
-                            escaped_command, working_dir, idle_timeout
-                        );
+                        debug!("ABOUT TO CALL execute_bash_streaming_in_dir: escaped_command='{}', working_dir={:?}", escaped_command, working_dir);
 
                         match executor
-                            .execute_bash_streaming_with_idle_timeout(
-                                &escaped_command,
-                                &receiver,
-                                working_dir,
-                                idle_timeout,
-                            )
+                            .execute_bash_streaming_in_dir(&escaped_command, &receiver, working_dir)
                             .await
                         {
                             Ok(result) => {
@@ -4901,6 +4839,50 @@ impl<W: UiWriter> Agent<W> {
                             .map(|obj| obj.keys().collect::<Vec<_>>())
                     );
                     Ok("❌ Missing command argument".to_string())
+                }
+            }
+            "background_process" => {
+                debug!("Processing background_process tool call");
+                let name = tool_call.args.get("name")
+                    .and_then(|v| v.as_str());
+                let name = match name {
+                    Some(n) => n,
+                    None => return Ok("❌ Missing 'name' argument".to_string()),
+                };
+
+                let command = tool_call.args.get("command")
+                    .and_then(|v| v.as_str());
+                let command = match command {
+                    Some(c) => c,
+                    None => return Ok("❌ Missing 'command' argument".to_string()),
+                };
+
+                // Use provided working_dir, or fall back to agent's working_dir, or current dir
+                let work_dir = tool_call.args.get("working_dir")
+                    .and_then(|v| v.as_str())
+                    .map(|s| std::path::PathBuf::from(shellexpand::tilde(s).as_ref()))
+                    .or_else(|| working_dir.map(std::path::PathBuf::from))
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+                match self.background_process_manager.start(name, command, &work_dir) {
+                    Ok(info) => {
+                        Ok(format!(
+                            "✅ Background process '{}' started\n\n\
+                            **PID:** {}\n\
+                            **Log file:** {}\n\
+                            **Working dir:** {}\n\n\
+                            To interact with this process, use the shell tool:\n\
+                            - View logs: `tail -100 {}`\n\
+                            - Follow logs: `tail -f {}` (blocks until Ctrl+C)\n\
+                            - Check status: `ps -p {}`\n\
+                            - Stop process: `kill {}`",
+                            info.name, info.pid, 
+                            info.log_file.display(), info.working_dir.display(),
+                            info.log_file.display(), info.log_file.display(),
+                            info.pid, info.pid
+                        ))
+                    }
+                    Err(e) => Ok(format!("❌ Failed to start background process: {}", e)),
                 }
             }
             "read_file" => {
@@ -5033,6 +5015,120 @@ impl<W: UiWriter> Agent<W> {
                     }
                 } else {
                     Ok("❌ Missing file_path argument".to_string())
+                }
+            }
+            "read_image" => {
+                debug!("Processing read_image tool call");
+                
+                // Get paths from file_paths array
+                let mut paths: Vec<String> = Vec::new();
+                
+                if let Some(file_paths) = tool_call.args.get("file_paths") {
+                    if let Some(arr) = file_paths.as_array() {
+                        for p in arr {
+                            if let Some(s) = p.as_str() {
+                                paths.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+                
+                if paths.is_empty() {
+                    return Ok("❌ Missing or empty file_paths argument".to_string());
+                }
+                
+                let mut results: Vec<String> = Vec::new();
+                let mut success_count = 0;
+                
+                // Print └─ before images to break out of tool output box
+                // Print └─ and newline before images to break out of tool output box
+                println!("└─\n");
+                
+                for path_str in &paths {
+                    // Expand tilde (~) to home directory
+                    let expanded_path = shellexpand::tilde(path_str);
+                    let path = std::path::Path::new(expanded_path.as_ref());
+                    
+                    // Check file exists
+                    if !path.exists() {
+                        results.push(format!("❌ Image file not found: {}", path_str));
+                        continue;
+                    }
+                    
+                    // Read the file first, then detect format from magic bytes
+                    match std::fs::read(path) {
+                        Ok(bytes) => {
+                            // Detect media type from magic bytes (file signature)
+                            let media_type = match g3_providers::ImageContent::media_type_from_bytes(&bytes) {
+                                Some(mt) => mt,
+                                None => {
+                                    // Fall back to extension-based detection
+                                    let ext = path.extension()
+                                        .and_then(|e| e.to_str())
+                                        .unwrap_or("");
+                                    match g3_providers::ImageContent::media_type_from_extension(ext) {
+                                        Some(mt) => mt,
+                                        None => {
+                                            results.push(format!(
+                                                "❌ {}: Unsupported or unrecognized image format",
+                                                path_str
+                                            ));
+                                            continue;
+                                        }
+                                    }
+                                }
+                            };
+                            
+                            let file_size = bytes.len();
+                            
+                            // Try to get image dimensions
+                            let dimensions = Self::get_image_dimensions(&bytes, media_type);
+                            
+                            // Build info string
+                            let dim_str = dimensions
+                                .map(|(w, h)| format!("{}x{}", w, h))
+                                .unwrap_or_else(|| "unknown".to_string());
+                            
+                            let size_str = if file_size >= 1024 * 1024 {
+                                format!("{:.1} MB", file_size as f64 / (1024.0 * 1024.0))
+                            } else if file_size >= 1024 {
+                                format!("{:.1} KB", file_size as f64 / 1024.0)
+                            } else {
+                                format!("{} bytes", file_size)
+                            };
+                            
+                            // Output imgcat inline image to terminal (height constrained)
+                            // followed by info line
+                            Self::print_imgcat(&bytes, path_str, &dim_str, media_type, &size_str, 5);
+                            
+                            // Store the image to be attached to the next user message
+                            use base64::Engine;
+                            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            let image = g3_providers::ImageContent::new(media_type, encoded);
+                            self.pending_images.push(image);
+                            
+                            success_count += 1;
+                        }
+                        Err(e) => {
+                            results.push(format!("❌ Failed to read '{}': {}", path_str, e));
+                        }
+                    }
+                }
+                
+                // Print ┌─ to resume tool output box
+                print!("┌─\n");
+                
+                let summary = if success_count == paths.len() {
+                    format!("{} image(s) read.", success_count)
+                } else {
+                    format!("{}/{} image(s) read.", success_count, paths.len())
+                };
+                
+                // Only include error results if there are any
+                if results.is_empty() {
+                    Ok(summary)
+                } else {
+                    Ok(format!("{}\n{}", results.join("\n"), summary))
                 }
             }
             "write_file" => {
@@ -5280,11 +5376,15 @@ impl<W: UiWriter> Agent<W> {
             "final_output" => {
                 if let Some(summary) = tool_call.args.get("summary") {
                     if let Some(summary_str) = summary.as_str() {
+                        // Save session continuation artifact
+                        self.save_session_continuation(Some(summary_str.to_string()));
                         Ok(summary_str.to_string())
                     } else {
+                        self.save_session_continuation(None);
                         Ok("✅ Turn completed".to_string())
                     }
                 } else {
+                    self.save_session_continuation(None);
                     Ok("✅ Turn completed".to_string())
                 }
             }
@@ -5365,8 +5465,13 @@ impl<W: UiWriter> Agent<W> {
             }
             "todo_read" => {
                 debug!("Processing todo_read tool call");
-                // Read from todo.g3.md file (uses G3_TODO_PATH env var if set, else current dir)
-                let todo_path = get_todo_path();
+                // Read from session-specific todo.g3.md if we have a session, else fall back to workspace
+                let todo_path = if let Some(ref session_id) = self.session_id {
+                    let _ = ensure_session_dir(session_id); // Ensure dir exists
+                    get_session_todo_path(session_id)
+                } else {
+                    get_todo_path()
+                };
 
                 if !todo_path.exists() {
                     // Also update in-memory content to stay in sync
@@ -5443,8 +5548,6 @@ impl<W: UiWriter> Agent<W> {
                             if content.trim().is_empty() {
                                 Ok("📝 TODO list is empty".to_string())
                             } else {
-                                // Print the TODO content to the console
-                                self.ui_writer.print_context_status("📝 TODO list:");
                                 for line in content.lines() {
                                     self.ui_writer.print_tool_output_line(line);
                                 }
@@ -5481,7 +5584,12 @@ impl<W: UiWriter> Agent<W> {
                         // If all todos are complete, delete the file instead of writing
                         // EXCEPT in planner mode (G3_TODO_PATH is set) - preserve for rename to completed_todo_*.md
                         let in_planner_mode = std::env::var("G3_TODO_PATH").is_ok();
-                        let todo_path = get_todo_path();
+                        let todo_path = if let Some(ref session_id) = self.session_id {
+                            let _ = ensure_session_dir(session_id); // Ensure dir exists
+                            get_session_todo_path(session_id)
+                        } else {
+                            get_todo_path()
+                        };
                         
                         if !in_planner_mode && !has_incomplete && (content_str.contains("- [x]") || content_str.contains("- [X]")) {
                             if todo_path.exists() {
@@ -5502,8 +5610,6 @@ impl<W: UiWriter> Agent<W> {
                                 }
                             }
                         }
-
-                        // Write to todo.g3.md file (uses G3_TODO_PATH env var if set, else current dir)
 
                         match std::fs::write(&todo_path, content_str) {
                             Ok(_) => {
@@ -6166,7 +6272,7 @@ impl<W: UiWriter> Agent<W> {
                         let driver = mutex.into_inner();
                         match driver.quit().await {
                             Ok(_) => {
-                                info!("WebDriver session closed successfully");
+                                debug!("WebDriver session closed successfully");
 
                                 // Kill the safaridriver process
                                 if let Some(mut process) =
@@ -6175,7 +6281,7 @@ impl<W: UiWriter> Agent<W> {
                                     if let Err(e) = process.kill().await {
                                         warn!("Failed to kill safaridriver process: {}", e);
                                     } else {
-                                        info!("Safaridriver process terminated");
+                                        debug!("Safaridriver process terminated");
                                     }
                                 }
 
@@ -6602,6 +6708,88 @@ impl<W: UiWriter> Agent<W> {
         }
     }
 
+
+    /// Get image dimensions from raw bytes
+    fn get_image_dimensions(bytes: &[u8], media_type: &str) -> Option<(u32, u32)> {
+        match media_type {
+            "image/png" => {
+                // PNG: width at bytes 16-19, height at bytes 20-23 (big-endian)
+                if bytes.len() >= 24 {
+                    let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+                    let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+                    Some((width, height))
+                } else {
+                    None
+                }
+            }
+            "image/jpeg" => {
+                // JPEG: Need to find SOF0/SOF2 marker (FF C0 or FF C2)
+                let mut i = 2; // Skip FF D8
+                while i + 8 < bytes.len() {
+                    if bytes[i] == 0xFF {
+                        let marker = bytes[i + 1];
+                        // SOF0, SOF1, SOF2 markers contain dimensions
+                        if marker == 0xC0 || marker == 0xC1 || marker == 0xC2 {
+                            let height = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as u32;
+                            let width = u16::from_be_bytes([bytes[i + 7], bytes[i + 8]]) as u32;
+                            return Some((width, height));
+                        }
+                        // Skip to next marker
+                        if marker == 0xD8 || marker == 0xD9 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+                            i += 2;
+                        } else {
+                            let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+                            i += 2 + len;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                None
+            }
+            "image/gif" => {
+                // GIF: width at bytes 6-7, height at bytes 8-9 (little-endian)
+                if bytes.len() >= 10 {
+                    let width = u16::from_le_bytes([bytes[6], bytes[7]]) as u32;
+                    let height = u16::from_le_bytes([bytes[8], bytes[9]]) as u32;
+                    Some((width, height))
+                } else {
+                    None
+                }
+            }
+            "image/webp" => {
+                // WebP VP8: dimensions at specific offsets (simplified)
+                // This is a basic implementation - WebP format is complex
+                if bytes.len() >= 30 && &bytes[12..16] == b"VP8 " {
+                    // Lossy WebP
+                    let width = (u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3FFF) as u32;
+                    let height = (u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3FFF) as u32;
+                    Some((width, height))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Print image using iTerm2 imgcat protocol with info line
+    fn print_imgcat(bytes: &[u8], name: &str, dimensions: &str, media_type: &str, size: &str, max_height: u32) {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        // Extract just the filename from the path
+        let filename = std::path::Path::new(name)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or(name);
+        // iTerm2 inline image protocol (single space prefix)
+        print!(" \x1b]1337;File=inline=1;height={};name={}:{}\x07\n", max_height, name, encoded);
+        // Print dimmed info line with filename only (no │ prefix)
+        println!(" \x1b[2m{} | {} | {} | {}\x1b[0m", filename, dimensions, media_type, size);
+        // Blank line before next image (no │ prefix)
+        println!();
+    }
+
     fn format_duration(duration: Duration) -> String {
         let total_ms = duration.as_millis();
 
@@ -6616,435 +6804,29 @@ impl<W: UiWriter> Agent<W> {
             format!("{}m {:.1}s", minutes, remaining_seconds)
         }
     }
-}
 
-// Note: JSON tool call filtering is now handled by fixed_filter_json::fixed_filter_json_tool_calls
-
-// Apply unified diff to an input string with optional [start, end) bounds
-pub fn apply_unified_diff_to_string(
-    file_content: &str,
-    diff: &str,
-    start_char: Option<usize>,
-    end_char: Option<usize>,
-) -> Result<String> {
-    // Parse full unified diff into hunks and apply sequentially.
-    let hunks = parse_unified_diff_hunks(diff);
-    if hunks.is_empty() {
-        anyhow::bail!(
-            "Invalid diff format. Expected unified diff with @@ hunks or +/- with context lines"
-        );
-    }
-
-    // Normalize line endings to avoid CRLF/CR mismatches
-    let content_norm = file_content.replace("\r\n", "\n").replace('\r', "\n");
-
-    // Determine and validate the search range
-    let search_start = start_char.unwrap_or(0);
-    let search_end = end_char.unwrap_or(content_norm.len());
-
-    if search_start > content_norm.len() {
-        anyhow::bail!(
-            "start position {} exceeds file length {}",
-            search_start,
-            content_norm.len()
-        );
-    }
-    if search_end > content_norm.len() {
-        anyhow::bail!(
-            "end position {} exceeds file length {}",
-            search_end,
-            content_norm.len()
-        );
-    }
-    if search_start > search_end {
-        anyhow::bail!(
-            "start position {} is greater than end position {}",
-            search_start,
-            search_end
-        );
-    }
-
-    // Extract the region we're going to modify, ensuring we're at char boundaries
-    // Find the nearest valid char boundaries
-    let start_boundary = if search_start == 0 {
-        0
-    } else {
-        content_norm
-            .char_indices()
-            .find(|(i, _)| *i >= search_start)
-            .map(|(i, _)| i)
-            .unwrap_or(search_start)
-    };
-    let end_boundary = content_norm
-        .char_indices()
-        .find(|(i, _)| *i >= search_end)
-        .map(|(i, _)| i)
-        .unwrap_or(content_norm.len());
-
-    let mut region_content = content_norm[start_boundary..end_boundary].to_string();
-
-    // Apply hunks in order
-    for (idx, (old_block, new_block)) in hunks.iter().enumerate() {
-        debug!(
-            "Applying hunk {}: old_len={}, new_len={}",
-            idx + 1,
-            old_block.len(),
-            new_block.len()
-        );
-
-        if let Some(pos) = region_content.find(old_block) {
-            let endpos = pos + old_block.len();
-            region_content.replace_range(pos..endpos, new_block);
+    /// Format the timing footer with optional token usage info
+    fn format_timing_footer(
+        elapsed: Duration,
+        ttft: Duration,
+        turn_tokens: Option<u32>,
+        context_percentage: f32,
+    ) -> String {
+        let timing = format!("⏱️ {} | 💭 {}", Self::format_duration(elapsed), Self::format_duration(ttft));
+        
+        // Add token usage info if available (dimmed)
+        if let Some(tokens) = turn_tokens {
+            format!("{}  \x1b[2m{} ◉ | {:.0}%\x1b[0m", timing, tokens, context_percentage)
         } else {
-            // Not found; provide helpful diagnostics with a short preview
-            let preview_len = old_block.len().min(200);
-            let mut old_preview = old_block[..preview_len].to_string();
-            if old_block.len() > preview_len {
-                old_preview.push_str("...");
-            }
-
-            let range_note = if start_char.is_some() || end_char.is_some() {
-                format!(
-                    " (within character range {}:{})",
-                    start_boundary, end_boundary
-                )
-            } else {
-                String::new()
-            };
-
-            anyhow::bail!(
-                "Pattern not found in file{}\nHunk {} failed. Searched for:\n{}",
-                range_note,
-                idx + 1,
-                old_preview
-            );
+            format!("{}  \x1b[2m{:.0}%\x1b[0m", timing, context_percentage)
         }
-    }
-
-    // Reconstruct the full content with the modified region
-    let mut result = String::with_capacity(content_norm.len() + region_content.len());
-    result.push_str(&content_norm[..start_boundary]);
-    result.push_str(&region_content);
-    result.push_str(&content_norm[end_boundary..]);
-    Ok(result)
-}
-
-// Parse a unified diff into a list of hunks as (old_block, new_block)
-// Each hunk contains the exact text to search for and the replacement text including context lines.
-fn parse_unified_diff_hunks(diff: &str) -> Vec<(String, String)> {
-    let mut hunks: Vec<(String, String)> = Vec::new();
-
-    let mut old_lines: Vec<String> = Vec::new();
-    let mut new_lines: Vec<String> = Vec::new();
-    let mut in_hunk = false;
-
-    for raw_line in diff.lines() {
-        let line = raw_line;
-
-        // Skip common diff headers
-        if line.starts_with("diff ")
-            || line.starts_with("index ")
-            || line.starts_with("new file mode")
-            || line.starts_with("deleted file mode")
-        {
-            continue;
-        }
-
-        if line.starts_with("--- ") || line.starts_with("+++ ") {
-            // File header lines — ignore
-            continue;
-        }
-
-        if line.starts_with("@@") {
-            // Starting a new hunk — flush previous if present
-            if in_hunk && (!old_lines.is_empty() || !new_lines.is_empty()) {
-                hunks.push((old_lines.join("\n"), new_lines.join("\n")));
-                old_lines.clear();
-                new_lines.clear();
-            }
-            in_hunk = true;
-            continue;
-        }
-
-        if !in_hunk {
-            // Some minimal diffs may omit @@; start collecting once we see diff markers
-            if line.starts_with(' ')
-                || (line.starts_with('-') && !line.starts_with("---"))
-                || (line.starts_with('+') && !line.starts_with("+++"))
-            {
-                in_hunk = true;
-            } else {
-                continue;
-            }
-        }
-
-        if let Some(content) = line.strip_prefix(' ') {
-            old_lines.push(content.to_string());
-            new_lines.push(content.to_string());
-        } else if line.starts_with('+') && !line.starts_with("+++") {
-            new_lines.push(line[1..].to_string());
-        } else if line.starts_with('-') && !line.starts_with("---") {
-            old_lines.push(line[1..].to_string());
-        } else if line.starts_with('\\') {
-            // Example: "\\ No newline at end of file" — ignore
-            continue;
-        } else {
-            // Unknown line type — ignore
-        }
-    }
-
-    if in_hunk && (!old_lines.is_empty() || !new_lines.is_empty()) {
-        hunks.push((old_lines.join("\n"), new_lines.join("\n")));
-    }
-
-    hunks
-}
-
-// Helper function to properly escape shell commands
-fn shell_escape_command(command: &str) -> String {
-    // Simple approach: if the command contains file paths with spaces,
-    // we need to be more intelligent about escaping
-
-    // For now, let's use a basic approach that handles common cases
-    // This is a simplified version - a full implementation would use proper shell parsing
-
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    if parts.is_empty() {
-        return command.to_string();
-    }
-
-    let cmd = parts[0];
-    let _args = &parts[1..];
-
-    // Commands that typically take file paths as arguments
-    let file_commands = [
-        "cat", "ls", "cp", "mv", "rm", "chmod", "chown", "file", "head", "tail", "wc", "grep",
-    ];
-
-    if file_commands.contains(&cmd) {
-        // For file commands, we need to be smarter about escaping
-        // Let's use a different approach: use the original command but wrap it in quotes if needed
-
-        // Check if the command already has proper quoting
-        if command.contains('"') || command.contains('\'') {
-            // Already has some quoting, use as-is
-            return command.to_string();
-        }
-
-        // Look for file paths that need escaping (contain spaces but aren't quoted)
-        let mut escaped_command = String::new();
-        let mut in_quotes = false;
-        let mut current_word = String::new();
-        let mut words = Vec::new();
-
-        for ch in command.chars() {
-            match ch {
-                ' ' if !in_quotes => {
-                    if !current_word.is_empty() {
-                        words.push(current_word.clone());
-                        current_word.clear();
-                    }
-                }
-                '"' => {
-                    in_quotes = !in_quotes;
-                    current_word.push(ch);
-                }
-                _ => {
-                    current_word.push(ch);
-                }
-            }
-        }
-
-        if !current_word.is_empty() {
-            words.push(current_word);
-        }
-
-        // Reconstruct the command with proper escaping
-        for (i, word) in words.iter().enumerate() {
-            if i > 0 {
-                escaped_command.push(' ');
-            }
-
-            // If this word looks like a file path (contains / or ~) and has spaces, quote it
-            if word.contains('/') || word.starts_with('~') {
-                if word.contains(' ') && !word.starts_with('"') && !word.starts_with('\'') {
-                    escaped_command.push_str(&format!("\"{}\"", word));
-                } else {
-                    escaped_command.push_str(word);
-                }
-            } else {
-                escaped_command.push_str(word);
-            }
-        }
-
-        escaped_command
-    } else {
-        // For non-file commands, use the original command
-        command.to_string()
     }
 }
 
-// Helper function to fix mixed quotes in JSON strings
-#[allow(dead_code)]
-fn fix_nested_quotes_in_shell_command(json_str: &str) -> String {
-    let mut _result = String::new();
-    let _chars = json_str.chars().peekable();
-    // Example: {"tool": "shell", "args": {"command": "python -c 'import os; print("hello")'"}
 
-    // Look for the pattern: "command": "
-    if let Some(command_start) = json_str.find(r#""command": ""#) {
-        let command_value_start = command_start + r#""command": ""#.len();
-
-        // Find the end of the command string by looking for the pattern "}
-        // We need to be careful about nested quotes
-        if let Some(end_marker) = json_str[command_value_start..].find(r#"" }"#) {
-            let command_end = command_value_start + end_marker;
-
-            let before = &json_str[..command_value_start];
-            let command_content = &json_str[command_value_start..command_end];
-            let after = &json_str[command_end..];
-
-            // Fix the command content by properly escaping quotes
-            let mut fixed_command = String::new();
-            let mut chars = command_content.chars().peekable();
-
-            while let Some(ch) = chars.next() {
-                match ch {
-                    '"' => {
-                        // Check if this quote is already escaped
-                        if fixed_command.ends_with('\\') {
-                            fixed_command.push(ch); // Already escaped, keep as-is
-                        } else {
-                            fixed_command.push_str(r#"\""#); // Escape the quote
-                        }
-                    }
-                    '\\' => {
-                        // Check what follows the backslash
-                        if let Some(&_next_ch) = chars.peek() {
-                            if _next_ch == '"' {
-                                // This is an escaped quote, keep the backslash
-                                fixed_command.push(ch);
-                            } else {
-                                // Regular backslash, escape it
-                                fixed_command.push_str(r#"\\"#);
-                            }
-                        } else {
-                            // Backslash at end, escape it
-                            fixed_command.push_str(r#"\\"#);
-                        }
-                    }
-                    _ => fixed_command.push(ch),
-                }
-            }
-
-            return format!("{}{}{}", before, fixed_command, after);
-        }
-    }
-
-    // Fallback: if we can't parse the structure, try some basic replacements
-    json_str.to_string()
-}
-
-// Helper function to fix mixed quotes in JSON (single quotes where double quotes should be)
-#[allow(dead_code)]
-fn fix_mixed_quotes_in_json(json_str: &str) -> String {
-    let mut result = String::new();
-    let mut chars = json_str.chars().peekable();
-    let mut in_string = false;
-    let mut string_delimiter = '"';
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' if !in_string => {
-                // Start of a double-quoted string
-                in_string = true;
-                string_delimiter = '"';
-                result.push(ch);
-            }
-            '\'' if !in_string => {
-                // Start of a single-quoted string - convert to double quotes
-                in_string = true;
-                string_delimiter = '\'';
-                result.push('"'); // Convert single quote to double quote
-            }
-            c if in_string && c == string_delimiter => {
-                // End of current string
-                if string_delimiter == '\'' {
-                    result.push('"'); // Convert single quote to double quote
-                } else {
-                    result.push(c);
-                }
-                in_string = false;
-            }
-            '"' if in_string && string_delimiter == '\'' => {
-                // Double quote inside single-quoted string - escape it
-                result.push_str(r#"\""#);
-            }
-            '\\' if in_string => {
-                // Escape sequence - preserve it
-                result.push(ch);
-                if let Some(&_next_ch) = chars.peek() {
-                    result.push(chars.next().unwrap());
-                }
-            }
-            _ => {
-                result.push(ch);
-            }
-        }
-    }
-
-    result
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_unified_diff_hunks;
-
-    #[test]
-    fn parses_minimal_unified_diff_without_hunk_header() {
-        let diff = "--- old\n-old text\n+++ new\n+new text\n";
-        let hunks = parse_unified_diff_hunks(diff);
-        assert_eq!(hunks.len(), 1);
-        assert_eq!(hunks[0].0, "old text");
-        assert_eq!(hunks[0].1, "new text");
-    }
-
-    #[test]
-    fn parses_diff_with_context_and_hunk_headers() {
-        let diff = "@@ -1,3 +1,3 @@\n common\n-old\n+new\n common2\n";
-        let hunks = parse_unified_diff_hunks(diff);
-        assert_eq!(hunks.len(), 1);
-        assert_eq!(hunks[0].0, "common\nold\ncommon2");
-        assert_eq!(hunks[0].1, "common\nnew\ncommon2");
-    }
-}
-
-#[cfg(test)]
-mod integration_tests {
-    use super::apply_unified_diff_to_string;
-
-    #[test]
-    fn apply_multi_hunk_unified_diff_to_string() {
-        let original = "line 1\nkeep\nold A\nkeep 2\nold B\nkeep 3\n";
-        let diff =
-            "@@ -1,6 +1,6 @@\n line 1\n keep\n-old A\n+new A\n keep 2\n-old B\n+new B\n keep 3\n";
-        let result = apply_unified_diff_to_string(original, diff, None, None).unwrap();
-        let expected = "line 1\nkeep\nnew A\nkeep 2\nnew B\nkeep 3\n";
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn apply_diff_within_range_only() {
-        let original = "A\nold\nB\nold\nC\n";
-        // Only the first 'old' should be replaced due to range
-        let diff = "@@ -1,3 +1,3 @@\n A\n-old\n+NEW\n B\n";
-        let start = 0usize; // Start of file
-        let end = original.find("B\n").unwrap() + 2; // up to end of line 'B\n'
-        let result = apply_unified_diff_to_string(original, diff, Some(start), Some(end)).unwrap();
-        let expected = "A\nNEW\nB\nold\nC\n";
-        assert_eq!(result, expected);
-    }
-}
+// Re-export utility functions
+pub use utils::apply_unified_diff_to_string;
+use utils::shell_escape_command;
 
 // Implement Drop to clean up safaridriver process
 impl<W: UiWriter> Drop for Agent<W> {

@@ -1,3 +1,4 @@
+use crate::filter_json::{filter_json_tool_calls, reset_json_tool_state};
 use g3_core::ui_writer::UiWriter;
 use std::io::{self, Write};
 use termimad::MadSkin;
@@ -208,7 +209,7 @@ impl UiWriter for ConsoleUiWriter {
         );
     }
 
-    fn print_tool_timing(&self, duration_str: &str) {
+    fn print_tool_timing(&self, duration_str: &str, tokens_delta: u32, context_percentage: f32) {
         // Parse the duration string to determine color
         // Format is like "1.5s", "500ms", "2m 30.0s"
         let color_code = if duration_str.ends_with("ms") {
@@ -250,7 +251,7 @@ impl UiWriter for ConsoleUiWriter {
             ""
         };
 
-        println!("└─ ⚡️ {}{}\x1b[0m", color_code, duration_str);
+        println!("└─ ⚡️ {}{}\x1b[0m  \x1b[2m{} ◉ | {:.0}%\x1b[0m", color_code, duration_str, tokens_delta, context_percentage);
         println!();
         // Clear the stored tool info
         *self.current_tool_name.lock().unwrap() = None;
@@ -349,5 +350,15 @@ impl UiWriter for ConsoleUiWriter {
         // Print a footer separator
         println!();
         println!("\x1b[1;35m━━━━━━━━━━━━━━━\x1b[0m");
+    }
+
+    fn filter_json_tool_calls(&self, content: &str) -> String {
+        // Apply JSON tool call filtering for display
+        filter_json_tool_calls(content)
+    }
+
+    fn reset_json_filter(&self) {
+        // Reset the filter state for a new response
+        reset_json_tool_state();
     }
 }

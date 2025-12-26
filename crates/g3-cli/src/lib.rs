@@ -1,3 +1,6 @@
+// JSON tool call filtering for display (moved from g3-core)
+pub mod filter_json;
+
 use anyhow::Result;
 use crossterm::style::{Color, ResetColor, SetForegroundColor};
 use std::time::{Duration, Instant};
@@ -152,9 +155,16 @@ fn extract_coach_feedback_from_logs(
         .get_session_id()
         .ok_or_else(|| anyhow::anyhow!("Coach agent has no session ID"))?;
 
-    // Construct the log file path for this specific coach session
-    let logs_dir = std::path::Path::new("logs");
-    let log_file_path = logs_dir.join(format!("g3_session_{}.json", session_id));
+    // Try new .g3/sessions/<session_id>/session.json path first
+    let log_file_path = g3_core::get_session_file(&session_id);
+    
+    // Fall back to old logs/ path if new path doesn't exist
+    let log_file_path = if log_file_path.exists() {
+        log_file_path
+    } else {
+        let logs_dir = std::path::Path::new("logs");
+        logs_dir.join(format!("g3_session_{}.json", session_id))
+    };
 
     // Read the coach agent's specific log file
     if log_file_path.exists() {
@@ -257,7 +267,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::exit;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, error};
 
 use g3_core::error_handling::{classify_error, ErrorType, RecoverableError};
 mod simple_output;
@@ -382,6 +392,10 @@ pub struct Cli {
     /// Enable fast codebase discovery before first LLM turn
     #[arg(long, value_name = "PATH")]
     pub codebase_fast_start: Option<PathBuf>,
+
+    /// Run as a specialized agent (loads prompt from agents/<name>.md)
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["autonomous", "auto", "chat", "planning"])]
+    pub agent: Option<String>,
 }
 
 pub async fn run() -> Result<()> {
@@ -416,6 +430,28 @@ pub async fn run() -> Result<()> {
             cli.workspace.clone(),
             cli.no_git,
             cli.config.as_deref(),
+        )
+        .await;
+    }
+
+    // Check if agent mode is enabled
+    if let Some(agent_name) = &cli.agent {
+        return run_agent_mode(
+            agent_name,
+            cli.workspace.clone(),
+            cli.config.as_deref(),
+            cli.quiet,
+        )
+        .await;
+    }
+
+    // Check if agent mode is enabled
+    if let Some(agent_name) = &cli.agent {
+        return run_agent_mode(
+            agent_name,
+            cli.workspace.clone(),
+            cli.config.as_deref(),
+            cli.quiet,
         )
         .await;
     }
@@ -619,6 +655,99 @@ pub async fn run() -> Result<()> {
         run_with_console_mode(agent, cli, project, combined_content).await?;
     }
 
+    Ok(())
+}
+
+/// Run agent mode - loads a specialized agent prompt and executes a single task
+async fn run_agent_mode(
+    agent_name: &str,
+    workspace: Option<PathBuf>,
+    config_path: Option<&str>,
+    _quiet: bool,
+) -> Result<()> {
+    use g3_core::get_agent_system_prompt;
+    
+    // Initialize logging
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+    let filter = EnvFilter::from_default_env()
+        .add_directive("g3_core=info".parse().unwrap())
+        .add_directive("g3_cli=info".parse().unwrap())
+        .add_directive("llama_cpp=off".parse().unwrap())
+        .add_directive("llama=off".parse().unwrap());
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(filter)
+        .init();
+
+    let output = SimpleOutput::new();
+    
+    // Determine workspace directory (current dir if not specified)
+    let workspace_dir = workspace.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    
+    // Load agent prompt from agents/<name>.md
+    let agent_prompt_path = workspace_dir.join("agents").join(format!("{}.md", agent_name));
+    
+    // Also check in the g3 installation directory
+    let agent_prompt = if agent_prompt_path.exists() {
+        std::fs::read_to_string(&agent_prompt_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read agent prompt from {:?}: {}", agent_prompt_path, e))?
+    } else {
+        // Try to find agents/ relative to the executable or in common locations
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        
+        let possible_paths = [
+            exe_dir.as_ref().map(|d| d.join("agents").join(format!("{}.md", agent_name))),
+            Some(PathBuf::from(format!("agents/{}.md", agent_name))),
+        ];
+        
+        let mut found_prompt = None;
+        for path_opt in possible_paths.iter().flatten() {
+            if path_opt.exists() {
+                found_prompt = Some(std::fs::read_to_string(path_opt)
+                    .map_err(|e| anyhow::anyhow!("Failed to read agent prompt from {:?}: {}", path_opt, e))?);
+                break;
+            }
+        }
+        
+        found_prompt.ok_or_else(|| anyhow::anyhow!(
+            "Agent prompt not found: agents/{}.md\nSearched in: {:?} and current directory",
+            agent_name, agent_prompt_path
+        ))?
+    };
+    
+    output.print(&format!("🤖 Running as agent: {}", agent_name));
+    output.print(&format!("📁 Working directory: {:?}", workspace_dir));
+    
+    // Load config
+    let config = g3_config::Config::load(config_path)?;
+    
+    // Generate the combined system prompt (agent prompt + tool instructions)
+    let system_prompt = get_agent_system_prompt(&agent_prompt, config.agent.allow_multiple_tool_calls);
+    
+    // Read README if present
+    let readme_content = std::fs::read_to_string(workspace_dir.join("README.md")).ok();
+    let readme_for_prompt = readme_content.map(|content| {
+        format!("📚 Project README (from README.md):\n\n{}", content)
+    });
+    
+    // Create agent with custom system prompt
+    let ui_writer = ConsoleUiWriter::new();
+    let mut agent = Agent::new_with_custom_prompt(
+        config,
+        ui_writer,
+        system_prompt,
+        readme_for_prompt,
+    ).await?;
+    
+    // The agent prompt should contain instructions to start working immediately
+    // Send an initial message to trigger the agent
+    let initial_task = "Begin your analysis and work on the current project. Follow your mission and workflow as specified in your instructions.";
+    
+    let _result = agent.execute_task(initial_task, None, true).await?;
+    
+    output.print("\n✅ Agent mode completed");
     Ok(())
 }
 
@@ -1265,6 +1394,54 @@ async fn run_interactive<W: UiWriter>(
 ) -> Result<()> {
     let output = SimpleOutput::new();
 
+    // Check for session continuation
+    if let Ok(Some(continuation)) = g3_core::load_continuation() {
+        output.print("");
+        output.print("🔄 Previous session detected!");
+        output.print(&format!(
+            "   Session: {}",
+            &continuation.session_id[..continuation.session_id.len().min(20)]
+        ));
+        output.print(&format!(
+            "   Context: {:.1}% used",
+            continuation.context_percentage
+        ));
+        if let Some(ref summary) = continuation.final_output_summary {
+            let preview: String = summary.chars().take(80).collect();
+            output.print(&format!("   Last output: {}...", preview));
+        }
+        output.print("");
+        output.print("Resume this session? [Y/n] ");
+        
+        // Read user input
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let input = input.trim().to_lowercase();
+        
+        if input.is_empty() || input == "y" || input == "yes" {
+            // Resume the session
+            match agent.restore_from_continuation(&continuation) {
+                Ok(true) => {
+                    output.print("✅ Full context restored from previous session");
+                }
+                Ok(false) => {
+                    output.print("✅ Session resumed with summary (context was > 80%)");
+                }
+                Err(e) => {
+                    output.print(&format!("⚠️ Could not restore session: {}", e));
+                    output.print("Starting fresh session instead.");
+                    // Clear the invalid continuation
+                    let _ = g3_core::clear_continuation();
+                }
+            }
+        } else {
+            // User declined, clear the continuation
+            output.print("🧹 Starting fresh session...");
+            let _ = g3_core::clear_continuation();
+        }
+        output.print("");
+    }
+
     output.print("");
     output.print("g3 programming agent");
     output.print("      >> what shall we build today?");
@@ -1408,6 +1585,7 @@ async fn run_interactive<W: UiWriter>(
                                 output.print("  /compact   - Trigger auto-summarization (compacts conversation history)");
                                 output.print("  /thinnify  - Trigger context thinning (replaces large tool results with file references)");
                                 output.print("  /skinnify  - Trigger full context thinning (like /thinnify but for entire context, not just first third)");
+                                output.print("  /clear     - Clear session and start fresh (discards continuation artifacts)");
                                 output.print(
                                     "  /readme    - Reload README.md and AGENTS.md from disk",
                                 );
@@ -1443,6 +1621,12 @@ async fn run_interactive<W: UiWriter>(
                             "/skinnify" => {
                                 let summary = agent.force_thin_all();
                                 println!("{}", summary);
+                                continue;
+                            }
+                            "/clear" => {
+                                output.print("🧹 Clearing session...");
+                                agent.clear_session();
+                                output.print("✅ Session cleared. Starting fresh.");
                                 continue;
                             }
                             "/readme" => {
@@ -1660,6 +1844,12 @@ async fn run_interactive_machine(
                             println!("{}", summary);
                             continue;
                         }
+                        "/clear" => {
+                            println!("COMMAND: clear");
+                            agent.clear_session();
+                            println!("RESULT: Session cleared");
+                            continue;
+                        }
                         "/readme" => {
                             println!("COMMAND: readme");
                             match agent.reload_readme() {
@@ -1682,7 +1872,7 @@ async fn run_interactive_machine(
                         }
                         "/help" => {
                             println!("COMMAND: help");
-                            println!("AVAILABLE_COMMANDS: /compact /thinnify /skinnify /readme /stats /help");
+                            println!("AVAILABLE_COMMANDS: /compact /thinnify /skinnify /clear /readme /stats /help");
                             continue;
                         }
                         _ => {
@@ -1821,7 +2011,7 @@ fn handle_execution_error(e: &anyhow::Error, input: &str, output: &SimpleOutput,
     // If it's a stream error, provide helpful guidance
     if e.to_string().contains("No response received") || e.to_string().contains("timed out") {
         output.print("💡 This may be a temporary issue. Please try again or check the logs for more details.");
-        output.print("   Log files are saved in the 'logs/' directory.");
+        output.print("   Log files are saved in the '.g3/sessions/' directory.");
     }
 }
 
@@ -1852,16 +2042,32 @@ fn display_context_progress<W: UiWriter>(agent: &Agent<W>, _output: &SimpleOutpu
         Color::Red
     };
 
+    // Format tokens as compact strings (e.g., "38.5k" instead of "38531")
+    let format_tokens = |tokens: u32| -> String {
+        if tokens >= 1_000_000 {
+            format!("{:.1}m", tokens as f64 / 1_000_000.0)
+        } else if tokens >= 1_000 {
+            let k = tokens as f64 / 1000.0;
+            if k >= 100.0 {
+                format!("{:.0}k", k)
+            } else {
+                format!("{:.1}k", k)
+            }
+        } else {
+            format!("{}", tokens)
+        }
+    };
+
     // Print with colored dots (using print! directly to handle color codes)
     print!(
-        "Context: {}{}{}{} {:.0}% ({}/{} tokens)\n",
+        "{}{}{}{} {}/{} ◉ | {:.0}%\n",
         SetForegroundColor(color),
         filled_str,
         empty_str,
         ResetColor,
-        percentage,
-        context.used_tokens,
-        context.total_tokens
+        format_tokens(context.used_tokens),
+        format_tokens(context.total_tokens),
+        percentage
     );
 }
 
@@ -2288,7 +2494,7 @@ async fn run_autonomous(
         let coach_config = base_config.for_coach()?;
 
         // Reset filter suppression state before creating coach agent
-        g3_core::fixed_filter_json::reset_fixed_json_tool_state();
+        crate::filter_json::reset_json_tool_state();
 
         let ui_writer = ConsoleUiWriter::new();
         let mut coach_agent =
@@ -2503,7 +2709,7 @@ Remember: Be clear in your review and concise in your feedback. APPROVE iff the 
             extract_coach_feedback_from_logs(&coach_result, &coach_agent, &output)?;
 
         // Log the size of the feedback for debugging
-        info!(
+        debug!(
             "Coach feedback extracted: {} characters (from {} total)",
             coach_feedback_text.len(),
             coach_result.response.len()
